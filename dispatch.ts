@@ -66,8 +66,8 @@ function writeRegistry(reg: Record<string, RegistryEntry>) {
 }
 
 /** Remove ended sessions older than STALE_HOURS and their directories */
-function cleanupStale(reg: Record<string, RegistryEntry>): Record<string, RegistryEntry> {
-  const cutoff = Date.now() - STALE_HOURS * 60 * 60 * 1000;
+function cleanupStale(reg: Record<string, RegistryEntry>, staleHours?: number): Record<string, RegistryEntry> {
+  const cutoff = Date.now() - (staleHours ?? STALE_HOURS) * 60 * 60 * 1000;
   let changed = false;
   for (const [id, entry] of Object.entries(reg)) {
     if (entry.status === "ended" && entry.endedAt && new Date(entry.endedAt).getTime() < cutoff) {
@@ -108,6 +108,7 @@ export default function (pi: ExtensionAPI) {
   let outboxPath = "";
   let lastInboxCount = 0;
   let watcher: fs.FSWatcher | null = null;
+  let sessionCtx: { hasUI: boolean; ui: { setWidget: (key: string, content: string[] | undefined, opts?: { placement?: string }) => void; notify: (msg: string, type?: string) => void } } | null = null;
 
   // --- Custom renderer for dispatch messages ---
   pi.registerMessageRenderer("dispatch", (message, options, theme) => {
@@ -218,6 +219,7 @@ export default function (pi: ExtensionAPI) {
                 { triggerTurn: true },
               );
             }
+            updateWidget();
           } catch {
             /* ignore watch errors */
           }
@@ -237,9 +239,13 @@ export default function (pi: ExtensionAPI) {
     } catch {}
 
     if (ctx.hasUI) ctx.ui.notify(`Dispatch: ${myId.slice(0, 12)}`, "info");
+
+    sessionCtx = ctx as typeof sessionCtx;
+    updateWidget();
   });
 
   pi.on("session_shutdown", async () => {
+    if (sessionCtx?.hasUI) sessionCtx.ui.setWidget("dispatch", undefined);
     watcher?.close();
     watcher = null;
     // Mark as ended — keep for STALE_HOURS so orchestrator can read outbox
@@ -299,6 +305,50 @@ export default function (pi: ExtensionAPI) {
     if (piName) return piName;
     const reg = readRegistry();
     return reg[myId]?.label ?? myId.slice(0, 12);
+  }
+
+  // --- Helper: update the belowEditor widget showing active children ---
+  function updateWidget() {
+    try {
+      if (!sessionCtx?.hasUI || !myId) return;
+      const reg = readRegistry();
+      const activeChildren = Object.values(reg).filter(
+        (e) => e.spawnedBy === myId && e.status === "active",
+      );
+
+      if (activeChildren.length === 0) {
+        sessionCtx.ui.setWidget("dispatch", undefined);
+        return;
+      }
+
+      const lines: string[] = [];
+      for (const child of activeChildren) {
+        const name = child.label ?? child.sessionId.slice(0, 12);
+        // Read last message from child's outbox for status context
+        const childOutbox = path.join(sessionDir(child.sessionId), "outbox.jsonl");
+        const msgs = readMsgs(childOutbox);
+        const lastMsg = msgs.length > 0 ? msgs[msgs.length - 1] : null;
+
+        let statusText = "active";
+        if (lastMsg) {
+          const icon =
+            lastMsg.type === "complete" ? "✅" :
+            lastMsg.type === "error" ? "❌" :
+            lastMsg.type === "question" ? "❓" :
+            lastMsg.type === "status" ? "📡" : "📨";
+          const truncated = lastMsg.content.length > 60
+            ? lastMsg.content.slice(0, 57) + "..."
+            : lastMsg.content;
+          statusText = `${icon} ${truncated}`;
+        }
+
+        lines.push(`🏃 ${name} — ${statusText}`);
+      }
+
+      sessionCtx.ui.setWidget("dispatch", lines, { placement: "belowEditor" });
+    } catch {
+      /* widget update errors are non-fatal */
+    }
   }
 
   // --- Helper: send message to a target ---
@@ -391,6 +441,7 @@ export default function (pi: ExtensionAPI) {
     }),
     execute: async (_toolCallId, args) => {
       const result = sendToTarget(args.target, args.content, args.type ?? "message");
+      updateWidget();
       return { content: [{ type: "text" as const, text: result }] };
     },
   });
@@ -420,9 +471,12 @@ export default function (pi: ExtensionAPI) {
     parameters: Type.Object({}),
     execute: async (_toolCallId) => {
       syncMyLabel();
-      const reg = cleanupStale(readRegistry());
+      const reg = cleanupStale(readRegistry(), 1); // Auto-cleanup sessions ended >1hr ago
       const entries = Object.values(reg);
-      if (entries.length === 0) return { content: [{ type: "text" as const, text: "No dispatch sessions." }] };
+      if (entries.length === 0) {
+        updateWidget();
+        return { content: [{ type: "text" as const, text: "No dispatch sessions." }] };
+      }
 
       const active = entries.filter((e) => e.status === "active");
       const ended = entries.filter((e) => e.status === "ended");
@@ -443,6 +497,7 @@ export default function (pi: ExtensionAPI) {
           lines.push(`  - ${e.sessionId.slice(0, 12)} | ${e.label ?? "unnamed"}${ago}`);
         }
       }
+      updateWidget();
       return { content: [{ type: "text" as const, text: lines.join("\n") }] };
     },
   });
@@ -547,6 +602,9 @@ export default function (pi: ExtensionAPI) {
           const pendingFile = path.join(DISPATCH_DIR, `_pending_iterm_${itermId}.json`);
           fs.writeFileSync(pendingFile, JSON.stringify({ itermSessionId: itermId, spawnedBy: myId, name: childName }));
 
+          // Widget will update when child registers and sends its first message
+          updateWidget();
+
           return {
             content: [
               {
@@ -594,6 +652,7 @@ export default function (pi: ExtensionAPI) {
           entry.status = "ended";
           entry.endedAt = new Date().toISOString();
           writeRegistry(reg);
+          updateWidget();
           return { content: [{ type: "text" as const, text: `Sent SIGTERM to pid ${entry.pid}. No iTerm session ID was recorded.` }] };
         } catch {
           return { content: [{ type: "text" as const, text: `No iTerm session ID and could not kill pid ${entry.pid}.` }], isError: true };
@@ -633,6 +692,7 @@ export default function (pi: ExtensionAPI) {
         entry.status = "ended";
         entry.endedAt = new Date().toISOString();
         writeRegistry(reg);
+        updateWidget();
 
         if (result.includes("CLOSED:")) {
           return { content: [{ type: "text" as const, text: `Closed session ${args.target.slice(0, 12)} (iTerm tab closed).` }] };
