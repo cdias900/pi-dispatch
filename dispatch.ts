@@ -125,12 +125,14 @@ export default function (pi: ExtensionAPI) {
     };
     const s = styles[t] ?? styles.message;
 
-    // Build a clear header: [📊 from 🐋 bg agents implementation]
+    // Build a clear header: 📊 🐋 bg agents implementation
     const header = theme.fg(s.color, `${s.prefix} `) + theme.fg("accent", from);
     let text = header + "\n" + message.content;
     if (expanded && d?.ts) text += `\n${theme.fg("dim", `  at ${d.ts}`)}`;
 
-    return new Text(text, 0, 0);
+    const box = new Box(1, 1, (t2) => theme.bg("customMessageBg", t2));
+    box.addChild(new Text(text, 0, 0));
+    return box;
   });
 
   // --- Session lifecycle ---
