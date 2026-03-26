@@ -138,11 +138,9 @@ export default function (pi: ExtensionAPI) {
       text += `\n${theme.fg("dim", `  at ${ts}`)}`;
     }
 
-    const container = new Container(0, 0);
-    const bgBox = new Box(1, 1, (t2) => theme.bg("customMessageBg", t2));
-    bgBox.addChild(new Text(text, 0, 0));
-    container.addChild(bgBox);
-    return container;
+    const box = new Box(1, 1, (t2) => theme.bg("customMessageBg", t2));
+    box.addChild(new Text(text, 0, 0));
+    return box;
   });
 
   // --- Session lifecycle ---
