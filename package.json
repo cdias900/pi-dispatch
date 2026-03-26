@@ -1,0 +1,16 @@
+{
+  "name": "pi-dispatch",
+  "version": "1.0.0",
+  "description": "Multi-session orchestration for Pi — spawn, message, and manage child sessions across iTerm2 tabs",
+  "keywords": ["pi-package", "dispatch", "multi-session", "orchestration", "iterm2"],
+  "repository": { "type": "git", "url": "https://github.com/cdias900/pi-dispatch" },
+  "license": "MIT",
+  "peerDependencies": {
+    "@mariozechner/pi-coding-agent": "*",
+    "@mariozechner/pi-tui": "*",
+    "@sinclair/typebox": "*"
+  },
+  "pi": {
+    "extensions": ["./dispatch.ts"]
+  }
+}
