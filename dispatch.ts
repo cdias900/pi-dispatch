@@ -110,27 +110,37 @@ export default function (pi: ExtensionAPI) {
   let watcher: fs.FSWatcher | null = null;
 
   // --- Custom renderer for dispatch messages ---
-  pi.registerMessageRenderer("dispatch", (message, { expanded }, theme) => {
-    const d = message.details as { from?: string; type?: string; ts?: string } | undefined;
-    const t = d?.type ?? "message";
-    const from = d?.from ?? "unknown";
+  pi.registerMessageRenderer("dispatch", (message, options, theme) => {
+    let from = "unknown";
+    let msgType = "message";
+    let ts = "";
 
-    const styles: Record<string, { prefix: string; color: "accent" | "success" | "warning" | "error" | "info" }> = {
-      task: { prefix: "🎯 TASK", color: "accent" },
-      status: { prefix: "📊", color: "info" },
-      complete: { prefix: "✅ DONE", color: "success" },
-      error: { prefix: "❌ ERROR", color: "error" },
-      question: { prefix: "❓ QUESTION", color: "warning" },
-      message: { prefix: "💬", color: "info" },
-    };
-    const s = styles[t] ?? styles.message;
+    try {
+      const d = message.details as Record<string, string> | undefined;
+      if (d) {
+        from = d.from || "unknown";
+        msgType = d.type || "message";
+        ts = d.ts || "";
+      }
+    } catch {
+      // details parsing failed — use defaults
+    }
 
-    // Format: "child name: message content"
-    const label = theme.fg("accent", from) + theme.fg("dim", ": ");
-    let text = label + message.content;
-    if (expanded && d?.ts) text += `\n${theme.fg("dim", `  at ${d.ts}`)}`;
+    const prefix =
+      msgType === "complete" ? "✅" :
+      msgType === "error" ? "❌" :
+      msgType === "question" ? "❓" :
+      msgType === "task" ? "🎯" :
+      "📨";
 
-    return new Text(text, 0, 0);
+    let text = `${prefix} ${theme.fg("accent", from)}: ${message.content}`;
+    if (options.expanded && ts) {
+      text += `\n${theme.fg("dim", `  at ${ts}`)}`;
+    }
+
+    const box = new Box(1, 1, (t2) => theme.bg("customMessageBg", t2));
+    box.addChild(new Text(text, 0, 0));
+    return box;
   });
 
   // --- Session lifecycle ---
@@ -459,7 +469,7 @@ export default function (pi: ExtensionAPI) {
         "ROLE: You are a middle-level manager. You receive projects/tasks from the orchestrator and break them into smaller pieces.",
         "",
         "WORKFLOW:",
-        "1. On startup: use dispatch_list to see active sessions, then send a status to the orchestrator (dispatch_send target=orchestrator type=status) confirming you are ready.",
+        "1. On startup: FIRST use set_session_label to give yourself a short descriptive name. THEN use dispatch_list to see active sessions, then send a status to the orchestrator (dispatch_send target=orchestrator type=status) confirming you are ready.",
         "2. Default to using subagents (scout, planner, executor, reviewer) for all substantial work. You orchestrate — you don't implement inline.",
         "3. Report progress back to the orchestrator with dispatch_send (type=status for updates, type=complete when done, type=error if stuck, type=question if you need input).",
         "4. When your task is fully complete, send a final dispatch_send with type=complete summarizing what was accomplished.",
