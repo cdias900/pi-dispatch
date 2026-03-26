@@ -188,32 +188,35 @@ export default function (pi: ExtensionAPI) {
     lastInboxCount = readMsgs(inboxPath).length;
 
     // Watch inbox for new messages — near-instant delivery
-    try {
-      watcher = fs.watch(inboxPath, () => {
-        try {
-          const all = readMsgs(inboxPath);
-          const newMsgs = all.slice(lastInboxCount);
-          if (newMsgs.length === 0) return;
-          lastInboxCount = all.length;
+    // Delay watcher setup slightly to ensure renderer is fully registered
+    setTimeout(() => {
+      try {
+        watcher = fs.watch(inboxPath, () => {
+          try {
+            const all = readMsgs(inboxPath);
+            const newMsgs = all.slice(lastInboxCount);
+            if (newMsgs.length === 0) return;
+            lastInboxCount = all.length;
 
-          for (const msg of newMsgs) {
-            pi.sendMessage(
-              {
-                customType: "dispatch",
-                content: msg.content || "(empty)",
-                display: true,
-                details: { from: msg.fromName ?? msg.from, type: msg.type, ts: msg.ts },
-              },
-              { triggerTurn: true },
-            );
+            for (const msg of newMsgs) {
+              pi.sendMessage(
+                {
+                  customType: "dispatch",
+                  content: msg.content || "(empty)",
+                  display: true,
+                  details: { from: msg.fromName ?? msg.from, type: msg.type, ts: msg.ts },
+                },
+                { triggerTurn: true },
+              );
+            }
+          } catch {
+            /* ignore watch errors */
           }
-        } catch {
-          /* ignore watch errors */
-        }
-      });
-    } catch {
-      /* fs.watch not available */
-    }
+        });
+      } catch {
+        /* fs.watch not available */
+      }
+    }, 500);
 
     // Update label from Pi session name right away
     try {
