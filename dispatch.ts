@@ -184,6 +184,7 @@ export default function (pi: ExtensionAPI) {
         const data = JSON.parse(fs.readFileSync(pfPath, "utf-8"));
         entry.itermSessionId = data.itermSessionId;
         entry.spawnedBy = data.spawnedBy;
+        if (data.name) entry.label = data.name;
         fs.unlinkSync(pfPath);
         break;
       }
@@ -455,6 +456,7 @@ export default function (pi: ExtensionAPI) {
     parameters: Type.Object({
       task: Type.String({ description: "The task/prompt to give the new Pi session" }),
       cwd: Type.Optional(Type.String({ description: "Working directory for the new session (default: current directory)" })),
+      name: Type.Optional(Type.String({ description: "Human-readable name for this child session (shown in messages and dispatch_list)" })),
       model: Type.Optional(Type.String({ description: "Model to use (e.g. 'sonnet', 'opus'). Default: agent default" })),
       extensions: Type.Optional(Type.String({ description: "Comma-separated additional extensions to load (e.g. 'slack,gworkspace')" })),
       skills: Type.Optional(Type.String({ description: "Comma-separated skills to load (e.g. 'graphite,stack')" })),
@@ -540,9 +542,10 @@ export default function (pi: ExtensionAPI) {
         const match = result.match(/SPAWNED:(.+)/);
         if (match) {
           const itermId = match[1];
-          // Save iTerm session ID so we can map it when the child registers
+          const childName = args.name || undefined;
+          // Save iTerm session ID + name so we can map it when the child registers
           const pendingFile = path.join(DISPATCH_DIR, `_pending_iterm_${itermId}.json`);
-          fs.writeFileSync(pendingFile, JSON.stringify({ itermSessionId: itermId, spawnedBy: myId }));
+          fs.writeFileSync(pendingFile, JSON.stringify({ itermSessionId: itermId, spawnedBy: myId, name: childName }));
 
           return {
             content: [
