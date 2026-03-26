@@ -331,7 +331,7 @@ export default function (pi: ExtensionAPI) {
         widgetInterval = setInterval(updateWidget, 1000);
       }
 
-      const lines: string[] = [`🏃 Child agents (${activeChildren.length})`];
+      const lines: string[] = [];
       for (const child of activeChildren) {
         const name = child.label ?? child.sessionId.slice(0, 12);
         // Calculate elapsed time
@@ -345,7 +345,8 @@ export default function (pi: ExtensionAPI) {
         lines.push(`  🏃 ${name} — active (${elapsedStr})`);
       }
 
-      sessionCtx.ui.setWidget("dispatch-children", lines);
+      lines.sort();
+      sessionCtx.ui.setWidget("dispatch-children", [`🏃 Child agents (${activeChildren.length})`, ...lines]);
     } catch {
       /* widget update errors are non-fatal */
     }
