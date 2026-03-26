@@ -135,7 +135,23 @@ export default function (pi: ExtensionAPI) {
 
   // --- Session lifecycle ---
   pi.on("session_start", async (_event, ctx) => {
-    myId = ctx.sessionId ?? `anon-${process.pid}`;
+    // Determine our dispatch ID. On /resume, try to reclaim our previous ID
+    // so children's spawnedBy references still work.
+    const candidateId = `anon-${process.pid}`;
+    const existingReg = readRegistry();
+
+    // Check if there's a previous entry from this same cwd that children reference
+    const previousEntry = Object.values(existingReg).find(
+      (e) => e.status === "active" && e.cwd === process.cwd() && e.sessionId !== candidateId
+        && Object.values(existingReg).some((child) => child.spawnedBy === e.sessionId && child.status === "active"),
+    );
+
+    if (previousEntry) {
+      // Reclaim the old ID so children can still reach us
+      myId = previousEntry.sessionId;
+    } else {
+      myId = candidateId;
+    }
     myDir = sessionDir(myId);
     inboxPath = path.join(myDir, "inbox.jsonl");
     outboxPath = path.join(myDir, "outbox.jsonl");
