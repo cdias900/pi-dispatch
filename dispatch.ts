@@ -117,21 +117,20 @@ export default function (pi: ExtensionAPI) {
 
     const styles: Record<string, { prefix: string; color: "accent" | "success" | "warning" | "error" | "info" }> = {
       task: { prefix: "🎯 TASK", color: "accent" },
-      status: { prefix: "📊 STATUS", color: "info" },
+      status: { prefix: "📊", color: "info" },
       complete: { prefix: "✅ DONE", color: "success" },
       error: { prefix: "❌ ERROR", color: "error" },
       question: { prefix: "❓ QUESTION", color: "warning" },
-      message: { prefix: "💬 MSG", color: "info" },
+      message: { prefix: "💬", color: "info" },
     };
     const s = styles[t] ?? styles.message;
 
-    const header = theme.fg(s.color, `[${s.prefix} from ${from}]`);
-    let text = `${header}\n${message.content}`;
+    // Build a clear header: [📊 from 🐋 bg agents implementation]
+    const header = theme.fg(s.color, `${s.prefix} `) + theme.fg("accent", from);
+    let text = header + "\n" + message.content;
     if (expanded && d?.ts) text += `\n${theme.fg("dim", `  at ${d.ts}`)}`;
 
-    const box = new Box(1, 1, (t2) => theme.bg("customMessageBg", t2));
-    box.addChild(new Text(text, 0, 0));
-    return box;
+    return new Text(text, 0, 0);
   });
 
   // --- Session lifecycle ---
