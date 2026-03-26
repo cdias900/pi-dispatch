@@ -108,7 +108,7 @@ export default function (pi: ExtensionAPI) {
   let outboxPath = "";
   let lastInboxCount = 0;
   let watcher: fs.FSWatcher | null = null;
-  let sessionCtx: { hasUI: boolean; ui: { setWidget: (key: string, content: string[] | undefined, opts?: { placement?: string }) => void; notify: (msg: string, type?: string) => void } } | null = null;
+  let sessionCtx: { hasUI: boolean; ui: { setWidget: (key: string, content: string[] | undefined) => void; notify: (msg: string, type?: string) => void } } | null = null;
 
   // --- Custom renderer for dispatch messages ---
   pi.registerMessageRenderer("dispatch", (message, options, theme) => {
@@ -245,7 +245,7 @@ export default function (pi: ExtensionAPI) {
   });
 
   pi.on("session_shutdown", async () => {
-    if (sessionCtx?.hasUI) sessionCtx.ui.setWidget("dispatch", undefined);
+    if (sessionCtx?.hasUI) sessionCtx.ui.setWidget("dispatch-children", undefined);
     watcher?.close();
     watcher = null;
     // Mark as ended — keep for STALE_HOURS so orchestrator can read outbox
@@ -307,7 +307,7 @@ export default function (pi: ExtensionAPI) {
     return reg[myId]?.label ?? myId.slice(0, 12);
   }
 
-  // --- Helper: update the belowEditor widget showing active children ---
+  // --- Helper: update widget showing active children ---
   function updateWidget() {
     try {
       if (!sessionCtx?.hasUI || !myId) return;
@@ -317,35 +317,25 @@ export default function (pi: ExtensionAPI) {
       );
 
       if (activeChildren.length === 0) {
-        sessionCtx.ui.setWidget("dispatch", undefined);
+        sessionCtx.ui.setWidget("dispatch-children", undefined);
         return;
       }
 
-      const lines: string[] = [];
+      const lines: string[] = [`🏃 Child agents running (${activeChildren.length})`];
       for (const child of activeChildren) {
         const name = child.label ?? child.sessionId.slice(0, 12);
-        // Read last message from child's outbox for status context
-        const childOutbox = path.join(sessionDir(child.sessionId), "outbox.jsonl");
-        const msgs = readMsgs(childOutbox);
-        const lastMsg = msgs.length > 0 ? msgs[msgs.length - 1] : null;
+        // Calculate elapsed time
+        const elapsed = Math.floor((Date.now() - new Date(child.startedAt).getTime()) / 1000);
+        const elapsedStr = elapsed >= 3600
+          ? `${Math.floor(elapsed / 3600)}h ${Math.floor((elapsed % 3600) / 60)}m`
+          : elapsed >= 60
+            ? `${Math.floor(elapsed / 60)}m ${elapsed % 60}s`
+            : `${elapsed}s`;
 
-        let statusText = "active";
-        if (lastMsg) {
-          const icon =
-            lastMsg.type === "complete" ? "✅" :
-            lastMsg.type === "error" ? "❌" :
-            lastMsg.type === "question" ? "❓" :
-            lastMsg.type === "status" ? "📡" : "📨";
-          const truncated = lastMsg.content.length > 60
-            ? lastMsg.content.slice(0, 57) + "..."
-            : lastMsg.content;
-          statusText = `${icon} ${truncated}`;
-        }
-
-        lines.push(`🏃 ${name} — ${statusText}`);
+        lines.push(`  🏃 ${name} — active (${elapsedStr})`);
       }
 
-      sessionCtx.ui.setWidget("dispatch", lines, { placement: "belowEditor" });
+      sessionCtx.ui.setWidget("dispatch-children", lines);
     } catch {
       /* widget update errors are non-fatal */
     }
