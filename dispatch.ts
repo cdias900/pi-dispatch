@@ -321,7 +321,7 @@ export default function (pi: ExtensionAPI) {
         return;
       }
 
-      const lines: string[] = [`🏃 Child agents running (${activeChildren.length})`];
+      const lines: string[] = [`🏃 Child agents (${activeChildren.length})`];
       for (const child of activeChildren) {
         const name = child.label ?? child.sessionId.slice(0, 12);
         // Calculate elapsed time
@@ -564,10 +564,12 @@ export default function (pi: ExtensionAPI) {
         "    if not window:",
         '        print("ERROR: No iTerm2 window found")',
         "        return",
+        "    current_tab = window.current_tab",
         "    tab = await window.async_create_tab()",
         "    session = tab.current_session",
         `    cmd = ${JSON.stringify(shellCmd)} + chr(13)`,
         "    await session.async_send_text(cmd)",
+        "    await current_tab.async_select()",
         "    print(f'SPAWNED:{session.session_id}')",
         "",
         "iterm2.run_until_complete(main)",
