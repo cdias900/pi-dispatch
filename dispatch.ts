@@ -313,7 +313,7 @@ export default function (pi: ExtensionAPI) {
       if (!sessionCtx?.hasUI || !myId) return;
       const reg = readRegistry();
       const activeChildren = Object.values(reg).filter(
-        (e) => e.spawnedBy === myId && e.status === "active",
+        (e) => e.sessionId !== myId && e.spawnedBy === myId && e.status === "active",
       );
 
       if (activeChildren.length === 0) {
