@@ -17,7 +17,7 @@ import * as path from "node:path";
 import { execSync } from "node:child_process";
 import type { ExtensionAPI } from "@mariozechner/pi-coding-agent";
 import { Type } from "@sinclair/typebox";
-import { Box, Text } from "@mariozechner/pi-tui";
+import { Box, Container, Text } from "@mariozechner/pi-tui";
 
 const DISPATCH_DIR = path.join(process.env.HOME ?? "/tmp", ".pi", "dispatch");
 const ITERM_PY = path.join(process.env.HOME ?? "/tmp", ".local", "iterm2-env", "bin", "python3");
@@ -138,7 +138,11 @@ export default function (pi: ExtensionAPI) {
       text += `\n${theme.fg("dim", `  at ${ts}`)}`;
     }
 
-    return new Text(text, 0, 0);
+    const container = new Container(0, 0);
+    const bgBox = new Box(1, 1, (t2) => theme.bg("customMessageBg", t2));
+    bgBox.addChild(new Text(text, 0, 0));
+    container.addChild(bgBox);
+    return container;
   });
 
   // --- Session lifecycle ---
