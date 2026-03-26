@@ -109,6 +109,7 @@ export default function (pi: ExtensionAPI) {
   let lastInboxCount = 0;
   let watcher: fs.FSWatcher | null = null;
   let sessionCtx: { hasUI: boolean; ui: { setWidget: (key: string, content: string[] | undefined) => void; notify: (msg: string, type?: string) => void } } | null = null;
+  let widgetInterval: ReturnType<typeof setInterval> | null = null;
 
   // --- Custom renderer for dispatch messages ---
   pi.registerMessageRenderer("dispatch", (message, options, theme) => {
@@ -318,7 +319,16 @@ export default function (pi: ExtensionAPI) {
 
       if (activeChildren.length === 0) {
         sessionCtx.ui.setWidget("dispatch-children", undefined);
+        if (widgetInterval) {
+          clearInterval(widgetInterval);
+          widgetInterval = null;
+        }
         return;
+      }
+
+      // Keep elapsed time ticking while children are active
+      if (!widgetInterval) {
+        widgetInterval = setInterval(updateWidget, 1000);
       }
 
       const lines: string[] = [`🏃 Child agents (${activeChildren.length})`];
