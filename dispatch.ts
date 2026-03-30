@@ -566,8 +566,17 @@ export default function (pi: ExtensionAPI) {
       // Write Python script to temp file to avoid shell escaping issues
       const tmpScript = path.join(DISPATCH_DIR, `_spawn_${Date.now()}.py`);
       const shellCmd = `cd ${taskDir} && ${piCmd}`;
+      const childName = args.name || undefined;
+
+      // Pass spawn metadata to Python so it can write the pending file
+      // BEFORE sending the pi command (avoids race condition where child
+      // starts before the pending file exists)
+      const spawnMeta = JSON.stringify({ spawnedBy: myId, name: childName });
+
       const pyScript = [
         "import iterm2",
+        "import json",
+        "import os",
         "",
         "async def main(connection):",
         "    app = await iterm2.async_get_app(connection)",
@@ -577,6 +586,15 @@ export default function (pi: ExtensionAPI) {
         "        return",
         "    tab = await window.async_create_tab()",
         "    session = tab.current_session",
+        "",
+        "    # Write pending file BEFORE sending the pi command",
+        "    # so the child can pick it up during session_start",
+        `    meta = json.loads(${JSON.stringify(spawnMeta)})`,
+        "    meta['itermSessionId'] = session.session_id",
+        `    pending_path = os.path.join(${JSON.stringify(DISPATCH_DIR)}, f'_pending_iterm_{session.session_id}.json')`,
+        "    with open(pending_path, 'w') as f:",
+        "        json.dump(meta, f)",
+        "",
         `    cmd = ${JSON.stringify(shellCmd)} + chr(13)`,
         "    await session.async_send_text(cmd)",
         "    print(f'SPAWNED:{session.session_id}')",
@@ -588,7 +606,7 @@ export default function (pi: ExtensionAPI) {
 
       try {
         const result = execSync(`${ITERM_PY} ${tmpScript}`, {
-          timeout: 10000,
+          timeout: 30000,
           encoding: "utf-8",
         }).trim();
 
@@ -598,10 +616,6 @@ export default function (pi: ExtensionAPI) {
         const match = result.match(/SPAWNED:(.+)/);
         if (match) {
           const itermId = match[1];
-          const childName = args.name || undefined;
-          // Save iTerm session ID + name so we can map it when the child registers
-          const pendingFile = path.join(DISPATCH_DIR, `_pending_iterm_${itermId}.json`);
-          fs.writeFileSync(pendingFile, JSON.stringify({ itermSessionId: itermId, spawnedBy: myId, name: childName }));
 
           // Widget will update when child registers and sends its first message
           updateWidget();
@@ -683,7 +697,7 @@ export default function (pi: ExtensionAPI) {
 
       try {
         const result = execSync(`${ITERM_PY} ${tmpScript}`, {
-          timeout: 10000,
+          timeout: 30000,
           encoding: "utf-8",
         }).trim();
 
