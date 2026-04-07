@@ -5,10 +5,16 @@
   "keywords": ["pi-package", "dispatch", "multi-session", "orchestration", "iterm2"],
   "repository": { "type": "git", "url": "https://github.com/cdias900/pi-dispatch" },
   "license": "MIT",
+  "scripts": {
+    "test": "node --import tsx --test dispatch-core.test.ts"
+  },
   "peerDependencies": {
     "@mariozechner/pi-coding-agent": "*",
     "@mariozechner/pi-tui": "*",
     "@sinclair/typebox": "*"
+  },
+  "devDependencies": {
+    "tsx": "^4.0.0"
   },
   "pi": {
     "extensions": ["./dispatch.ts"]

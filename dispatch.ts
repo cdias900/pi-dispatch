@@ -6,99 +6,53 @@
  *
  * Architecture:
  *   ~/.pi/dispatch/
- *     registry.json              # All active sessions
+ *     registry.json              # Legacy registry, auto-migrated if present
  *     <session-id>/
+ *       state.json               # Session state
  *       inbox.jsonl              # Messages TO this session
  *       outbox.jsonl             # Messages FROM this session
  */
 
 import * as fs from "node:fs";
+import * as os from "node:os";
 import * as path from "node:path";
 import { execSync } from "node:child_process";
 import type { ExtensionAPI } from "@mariozechner/pi-coding-agent";
 import { Type } from "@sinclair/typebox";
 import { Box, Container, Text } from "@mariozechner/pi-tui";
+import {
+  readRegistry as _readRegistry,
+  writeSessionState as _writeSessionState,
+  readSessionState as _readSessionState,
+  cleanupStale as _cleanupStale,
+  migrateRegistryIfNeeded as _migrateRegistryIfNeeded,
+  appendMsg, readMsgs, ensureDir,
+  sessionDir as _sessionDir,
+  isValidEntry,
+  type RegistryEntry,
+  type Message,
+} from "./dispatch-core.ts";
 
-const DISPATCH_DIR = path.join(process.env.HOME ?? "/tmp", ".pi", "dispatch");
-const ITERM_PY = path.join(process.env.HOME ?? "/tmp", ".local", "iterm2-env", "bin", "python3");
+const DISPATCH_DIR = path.join(os.homedir(), ".pi", "dispatch");
+const ITERM_PY = path.join(os.homedir(), ".local", "iterm2-env", "bin", "python3");
 
 const STALE_HOURS = 24; // Keep ended sessions for 24h before cleanup
 
-interface RegistryEntry {
-  sessionId: string;
-  cwd: string;
-  pid: number;
-  startedAt: string;
-  endedAt?: string; // Set when session shuts down
-  status: "active" | "ended";
+const readRegistry = () => _readRegistry(DISPATCH_DIR);
+const writeSessionState = (id: string, entry: RegistryEntry) => _writeSessionState(id, entry, DISPATCH_DIR);
+const readSessionState = (id: string) => _readSessionState(id, DISPATCH_DIR);
+const cleanupStale = (staleHours: number = STALE_HOURS) => _cleanupStale(DISPATCH_DIR, staleHours);
+const migrateRegistryIfNeeded = () => _migrateRegistryIfNeeded(DISPATCH_DIR);
+const sessionDir = (id: string) => _sessionDir(id, DISPATCH_DIR);
+
+const DISPATCH_GLOBAL_KEY = "__pi_dispatch_state";
+
+interface DispatchPersistedState {
+  myId: string;
+  spawnedBy?: string;
   label?: string;
-  itermSessionId?: string; // iTerm2 session ID for tab management
-  spawnedBy?: string; // Session ID of the parent that spawned this
-}
-
-interface Message {
-  ts: string;
-  from: string;
-  fromName?: string;
-  type: string; // message | task | status | complete | error | question
-  content: string;
-}
-
-function ensureDir(dir: string) {
-  if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
-}
-
-function sessionDir(id: string) {
-  return path.join(DISPATCH_DIR, id);
-}
-
-function readRegistry(): Record<string, RegistryEntry> {
-  try {
-    return JSON.parse(fs.readFileSync(path.join(DISPATCH_DIR, "registry.json"), "utf-8"));
-  } catch {
-    return {};
-  }
-}
-
-function writeRegistry(reg: Record<string, RegistryEntry>) {
-  ensureDir(DISPATCH_DIR);
-  fs.writeFileSync(path.join(DISPATCH_DIR, "registry.json"), JSON.stringify(reg, null, 2));
-}
-
-/** Remove ended sessions older than STALE_HOURS and their directories */
-function cleanupStale(reg: Record<string, RegistryEntry>, staleHours?: number): Record<string, RegistryEntry> {
-  const cutoff = Date.now() - (staleHours ?? STALE_HOURS) * 60 * 60 * 1000;
-  let changed = false;
-  for (const [id, entry] of Object.entries(reg)) {
-    if (entry.status === "ended" && entry.endedAt && new Date(entry.endedAt).getTime() < cutoff) {
-      delete reg[id];
-      changed = true;
-      try {
-        const dir = sessionDir(id);
-        if (fs.existsSync(dir)) fs.rmSync(dir, { recursive: true });
-      } catch {}
-    }
-  }
-  if (changed) writeRegistry(reg);
-  return reg;
-}
-
-function appendMsg(filePath: string, msg: Message) {
-  ensureDir(path.dirname(filePath));
-  fs.appendFileSync(filePath, JSON.stringify(msg) + "\n");
-}
-
-function readMsgs(filePath: string): Message[] {
-  try {
-    return fs
-      .readFileSync(filePath, "utf-8")
-      .trim()
-      .split("\n")
-      .filter(Boolean)
-      .map((l) => JSON.parse(l));
-  } catch {
-    return [];
-  }
+  itermSessionId?: string;
+  lastInboxCount: number;
 }
 
 export default function (pi: ExtensionAPI) {
@@ -108,6 +62,7 @@ export default function (pi: ExtensionAPI) {
   let outboxPath = "";
   let lastInboxCount = 0;
   let watcher: fs.FSWatcher | null = null;
+  let watcherTimeout: ReturnType<typeof setTimeout> | null = null;
   let sessionCtx: { hasUI: boolean; ui: { setWidget: (key: string, content: string[] | undefined) => void; notify: (msg: string, type?: string) => void } } | null = null;
   let widgetInterval: ReturnType<typeof setInterval> | null = null;
 
@@ -146,119 +101,309 @@ export default function (pi: ExtensionAPI) {
   });
 
   // --- Session lifecycle ---
-  pi.on("session_start", async (_event, ctx) => {
-    // Determine our dispatch ID. On /resume, try to reclaim our previous ID
-    // so children's spawnedBy references still work.
+  pi.on("session_start", async (event, ctx) => {
     const candidateId = `anon-${process.pid}`;
-    const existingReg = readRegistry();
+    let savedState: DispatchPersistedState | undefined;
+    let reclaimedFrom: RegistryEntry | undefined;
 
-    // Check if there's a previous entry from this same cwd that children reference
-    const previousEntry = Object.values(existingReg).find(
-      (e) => e.status === "active" && e.cwd === process.cwd() && e.sessionId !== candidateId
-        && Object.values(existingReg).some((child) => child.spawnedBy === e.sessionId && child.status === "active"),
-    );
-
-    if (previousEntry) {
-      // Reclaim the old ID so children can still reach us
-      myId = previousEntry.sessionId;
-    } else {
-      myId = candidateId;
-    }
-    myDir = sessionDir(myId);
-    inboxPath = path.join(myDir, "inbox.jsonl");
-    outboxPath = path.join(myDir, "outbox.jsonl");
-
-    ensureDir(myDir);
-    if (!fs.existsSync(inboxPath)) fs.writeFileSync(inboxPath, "");
-    if (!fs.existsSync(outboxPath)) fs.writeFileSync(outboxPath, "");
-
-    // Register in global registry + clean up stale sessions
-    const reg = cleanupStale(readRegistry());
-    const entry: RegistryEntry = { sessionId: myId, cwd: process.cwd(), pid: process.pid, startedAt: new Date().toISOString(), status: "active" };
-
-    // Check if we were spawned by an orchestrator — pick up iTerm session ID
     try {
-      const pendingFiles = fs.readdirSync(DISPATCH_DIR).filter((f) => f.startsWith("_pending_iterm_"));
-      for (const pf of pendingFiles) {
-        // We can't know which pending file is ours by iTerm ID alone,
-        // so we claim the most recent one (there should only be one at a time in practice)
-        const pfPath = path.join(DISPATCH_DIR, pf);
-        const data = JSON.parse(fs.readFileSync(pfPath, "utf-8"));
-        entry.itermSessionId = data.itermSessionId;
-        entry.spawnedBy = data.spawnedBy;
-        if (data.name) entry.label = data.name;
-        fs.unlinkSync(pfPath);
-        break;
+      migrateRegistryIfNeeded();
+
+      // On reload, restore identity from globalThis (survives module reimport)
+      if (event.reason === "reload") {
+        const persisted = (globalThis as any)[DISPATCH_GLOBAL_KEY] as DispatchPersistedState | undefined;
+        if (persisted?.myId) {
+          myId = persisted.myId;
+          savedState = persisted;
+        }
       }
-    } catch {}
+      // Always clean up globalThis to prevent stale carry-over
+      delete (globalThis as any)[DISPATCH_GLOBAL_KEY];
 
-    reg[myId] = entry;
-    writeRegistry(reg);
+      // Determine our dispatch ID. On /resume, try to reclaim our previous ID
+      // so children's spawnedBy references still work.
+      if (!myId) {
+        const existingReg = readRegistry();
+        const RECLAIM_WINDOW_MS = 60_000;
+        const now = Date.now();
 
-    // Skip old inbox messages
-    lastInboxCount = readMsgs(inboxPath).length;
+        const previousEntry = Object.values(existingReg).find((e) => {
+          if (e.cwd !== process.cwd()) return false;
+          if (typeof e.sessionId !== "string" || !e.sessionId.length) return false;
+          if (e.sessionId === candidateId) return false;
 
-    // Watch inbox for new messages — near-instant delivery
-    // Delay watcher setup slightly to ensure renderer is fully registered
-    setTimeout(() => {
-      try {
-        watcher = fs.watch(inboxPath, () => {
-          try {
-            const all = readMsgs(inboxPath);
-            const newMsgs = all.slice(lastInboxCount);
-            if (newMsgs.length === 0) return;
-            lastInboxCount = all.length;
+          const hasActiveChildren = Object.values(existingReg).some(
+            (child) =>
+              typeof child.spawnedBy === "string"
+              && child.spawnedBy.length > 0
+              && child.spawnedBy === e.sessionId
+              && child.status === "active",
+          );
+          if (!hasActiveChildren) return false;
 
-            for (const msg of newMsgs) {
-              pi.sendMessage(
-                {
-                  customType: "dispatch",
-                  content: msg.content || "(empty)",
-                  display: true,
-                  details: { from: msg.fromName ?? msg.from, type: msg.type, ts: msg.ts },
-                },
-                { triggerTurn: true },
-              );
+          if (e.status === "active") {
+            try {
+              process.kill(e.pid, 0);
+              return false; // Process alive — not ours to reclaim
+            } catch {
+              return true; // Process dead — safe to reclaim
             }
-            updateWidget();
-          } catch {
-            /* ignore watch errors */
           }
+
+          if (e.status === "ended" && e.endedAt) {
+            return (now - new Date(e.endedAt).getTime()) < RECLAIM_WINDOW_MS;
+          }
+
+          return false;
         });
-      } catch {
-        /* fs.watch not available */
+
+        if (previousEntry) {
+          myId = previousEntry.sessionId;
+          reclaimedFrom = previousEntry;
+        } else {
+          myId = candidateId;
+        }
       }
-    }, 500);
 
-    // Update label from Pi session name right away
-    try {
-      const piName = pi.getSessionName?.();
-      if (piName && reg[myId] && reg[myId].label !== piName) {
-        reg[myId].label = piName;
-        writeRegistry(reg);
+      // Safety net
+      if (!myId || typeof myId !== "string") {
+        myId = candidateId;
       }
-    } catch {}
 
-    if (ctx.hasUI) ctx.ui.notify(`Dispatch: ${myId.slice(0, 12)}`, "info");
+      myDir = sessionDir(myId);
+      inboxPath = path.join(myDir, "inbox.jsonl");
+      outboxPath = path.join(myDir, "outbox.jsonl");
 
-    sessionCtx = ctx as typeof sessionCtx;
-    updateWidget();
+      ensureDir(myDir);
+      if (!fs.existsSync(inboxPath)) fs.writeFileSync(inboxPath, "");
+      if (!fs.existsSync(outboxPath)) fs.writeFileSync(outboxPath, "");
+
+      // Register in global registry + clean up stale sessions
+      cleanupStale();
+      const reg = readRegistry();
+      const entry: RegistryEntry = {
+        sessionId: myId,
+        cwd: process.cwd(),
+        pid: process.pid,
+        startedAt: new Date().toISOString(),
+        status: "active",
+      };
+
+      // Carry forward metadata from saved state (reload) or existing registry entry
+      const existingEntry = reg[myId];
+      if (savedState) {
+        if (savedState.spawnedBy) entry.spawnedBy = savedState.spawnedBy;
+        if (savedState.label) entry.label = savedState.label;
+        if (savedState.itermSessionId) entry.itermSessionId = savedState.itermSessionId;
+      } else if (existingEntry) {
+        if (existingEntry.spawnedBy) entry.spawnedBy = existingEntry.spawnedBy;
+        if (existingEntry.label) entry.label = existingEntry.label;
+        if (existingEntry.itermSessionId) entry.itermSessionId = existingEntry.itermSessionId;
+      }
+
+      // Only claim pending spawn metadata on fresh starts (not reloads or reclaims with existing metadata)
+      if (!savedState && !entry.spawnedBy) {
+        try {
+          const myItermId = process.env.DISPATCH_ITERM_ID;
+          if (myItermId) {
+            // Exact match via env var — deterministic correlation
+            const pfPath = path.join(DISPATCH_DIR, `_pending_iterm_${myItermId}.json`);
+            if (fs.existsSync(pfPath)) {
+              const data = JSON.parse(fs.readFileSync(pfPath, "utf-8"));
+              entry.itermSessionId = myItermId;
+              entry.spawnedBy = data.spawnedBy;
+              if (data.name) entry.label = data.name;
+              fs.unlinkSync(pfPath);
+            }
+          } else {
+            // Fallback for manually-started sessions: claim first pending file
+            const pendingFiles = fs.readdirSync(DISPATCH_DIR).filter((f) => f.startsWith("_pending_iterm_"));
+            for (const pf of pendingFiles) {
+              const pfPath = path.join(DISPATCH_DIR, pf);
+              const data = JSON.parse(fs.readFileSync(pfPath, "utf-8"));
+              entry.itermSessionId = data.itermSessionId;
+              entry.spawnedBy = data.spawnedBy;
+              if (data.name) entry.label = data.name;
+              fs.unlinkSync(pfPath);
+              break;
+            }
+          }
+        } catch {}
+      }
+
+      writeSessionState(myId, entry);
+
+      // Skip old inbox messages
+      if (savedState) {
+        // Reload: continue from where we left off
+        lastInboxCount = savedState.lastInboxCount;
+      } else if (reclaimedFrom?.endedAt) {
+        // Restart/reclaim: replay messages that arrived after the previous session ended
+        const allMsgs = readMsgs(inboxPath);
+        const endedAt = new Date(reclaimedFrom.endedAt).getTime();
+        const gapStart = allMsgs.findIndex((m) => new Date(m.ts).getTime() > endedAt);
+        if (gapStart >= 0) {
+          lastInboxCount = gapStart;
+        } else {
+          lastInboxCount = allMsgs.length;
+        }
+      } else if (reclaimedFrom) {
+        // Reclaimed a dead-active entry without endedAt — replay recent messages
+        const allMsgs = readMsgs(inboxPath);
+        const recentCutoff = Date.now() - 60_000;
+        const gapStart = allMsgs.findIndex((m) => new Date(m.ts).getTime() > recentCutoff);
+        if (gapStart >= 0) {
+          lastInboxCount = gapStart;
+        } else {
+          lastInboxCount = allMsgs.length;
+        }
+      } else {
+        // Fresh start: treat all existing messages as old
+        lastInboxCount = readMsgs(inboxPath).length;
+      }
+
+      // Process any messages that arrived during the reload/restart gap
+      const currentMsgs = readMsgs(inboxPath);
+      if (currentMsgs.length > lastInboxCount) {
+        const backlog = currentMsgs.slice(lastInboxCount);
+        lastInboxCount = currentMsgs.length;
+        // Deliver backlog after a short delay to ensure UI is ready
+        setTimeout(() => {
+          for (const msg of backlog) {
+            pi.sendMessage(
+              {
+                customType: "dispatch",
+                content: msg.content || "(empty)",
+                display: true,
+                details: { from: msg.fromName ?? msg.from, type: msg.type, ts: msg.ts },
+              },
+              { triggerTurn: true },
+            );
+          }
+        }, 100);
+      }
+
+      // Watch inbox for new messages — near-instant delivery
+      // Delay watcher setup slightly to ensure renderer is fully registered
+      watcherTimeout = setTimeout(() => {
+        try {
+          watcherTimeout = null;
+          watcher = fs.watch(inboxPath, () => {
+            try {
+              const all = readMsgs(inboxPath);
+              const newMsgs = all.slice(lastInboxCount);
+              if (newMsgs.length === 0) return;
+              lastInboxCount = all.length;
+
+              for (const msg of newMsgs) {
+                pi.sendMessage(
+                  {
+                    customType: "dispatch",
+                    content: msg.content || "(empty)",
+                    display: true,
+                    details: { from: msg.fromName ?? msg.from, type: msg.type, ts: msg.ts },
+                  },
+                  { triggerTurn: true },
+                );
+              }
+              updateWidget();
+            } catch {
+              /* ignore watch errors */
+            }
+          });
+        } catch {
+          /* fs.watch not available */
+        }
+      }, 50);
+
+      // Update label from Pi session name right away
+      try {
+        const piName = pi.getSessionName?.();
+        const myEntry = readSessionState(myId);
+        if (piName && myEntry && myEntry.label !== piName) {
+          myEntry.label = piName;
+          writeSessionState(myId, myEntry);
+        }
+      } catch {}
+
+      if (ctx.hasUI) ctx.ui.notify(`Dispatch: ${myId.slice(0, 12)}`, "info");
+
+      sessionCtx = ctx as typeof sessionCtx;
+      updateWidget();
+    } catch (error) {
+      console.error("Dispatch session_start failed:", error);
+
+      if (!myId || typeof myId !== "string") {
+        myId = candidateId;
+      }
+      if (!myDir) {
+        myDir = sessionDir(myId);
+      }
+      if (!inboxPath) {
+        inboxPath = path.join(myDir, "inbox.jsonl");
+      }
+      if (!outboxPath) {
+        outboxPath = path.join(myDir, "outbox.jsonl");
+      }
+
+      try {
+        ensureDir(myDir);
+        if (!fs.existsSync(inboxPath)) fs.writeFileSync(inboxPath, "");
+        if (!fs.existsSync(outboxPath)) fs.writeFileSync(outboxPath, "");
+
+        // Best-effort: register in registry so we're at least discoverable
+        try {
+          const fallbackEntry: RegistryEntry = {
+            sessionId: myId,
+            cwd: process.cwd(),
+            pid: process.pid,
+            startedAt: new Date().toISOString(),
+            status: "active",
+          };
+          const itermId = process.env.DISPATCH_ITERM_ID;
+          if (itermId) {
+            const pfPath = path.join(DISPATCH_DIR, `_pending_iterm_${itermId}.json`);
+            if (fs.existsSync(pfPath)) {
+              const data = JSON.parse(fs.readFileSync(pfPath, "utf-8")) as { spawnedBy?: string; name?: string };
+              fallbackEntry.itermSessionId = itermId;
+              fallbackEntry.spawnedBy = data.spawnedBy;
+              if (data.name) fallbackEntry.label = data.name;
+              fs.unlinkSync(pfPath);
+            }
+          }
+          writeSessionState(myId, fallbackEntry);
+        } catch {}
+      } catch (fallbackError) {
+        console.error("Dispatch session_start fallback failed:", fallbackError);
+      }
+    }
   });
 
   pi.on("session_shutdown", async () => {
     if (sessionCtx?.hasUI) sessionCtx.ui.setWidget("dispatch-children", undefined);
+
+    if (watcherTimeout) { clearTimeout(watcherTimeout); watcherTimeout = null; }
     watcher?.close();
     watcher = null;
-    // Mark as ended — keep for STALE_HOURS so orchestrator can read outbox
+    if (widgetInterval) { clearInterval(widgetInterval); widgetInterval = null; }
+
+    // Save state to globalThis so a reload can recover identity
     try {
-      const reg = readRegistry();
-      if (reg[myId]) {
-        reg[myId].status = "ended";
-        reg[myId].endedAt = new Date().toISOString();
-        writeRegistry(reg);
+      const myEntry = readSessionState(myId);
+      (globalThis as any)[DISPATCH_GLOBAL_KEY] = {
+        myId,
+        spawnedBy: myEntry?.spawnedBy,
+        label: myEntry?.label,
+        itermSessionId: myEntry?.itermSessionId,
+        lastInboxCount,
+      } as DispatchPersistedState;
+
+      if (myEntry) {
+        myEntry.status = "ended";
+        myEntry.endedAt = new Date().toISOString();
+        writeSessionState(myId, myEntry);
       }
     } catch {}
-    // Don't delete the session dir — outbox may still have unread messages
   });
 
   // --- Helper: resolve target ID ---
@@ -267,20 +412,25 @@ export default function (pi: ExtensionAPI) {
       const reg = readRegistry();
       const myEntry = reg[myId];
 
-      // 1. If we were spawned by someone, that's our orchestrator
-      if (myEntry?.spawnedBy && reg[myEntry.spawnedBy]?.status === "active") {
-        return myEntry.spawnedBy;
+      // 1. If we know our parent, resolve to them if their inbox still exists
+      // (even if they're "ended" — they may be reloading and will come back)
+      if (myEntry?.spawnedBy) {
+        const parentInbox = path.join(sessionDir(myEntry.spawnedBy), "inbox.jsonl");
+        if (fs.existsSync(parentInbox)) {
+          return myEntry.spawnedBy;
+        }
       }
 
       // 2. Find by label containing "orchestrator"
       const match = Object.values(reg).find(
-        (e) => e.sessionId !== myId && e.status === "active" && e.label?.toLowerCase().includes("orchestrator"),
+        (e) => e.sessionId !== myId
+          && e.status === "active"
+          && e.cwd === process.cwd()
+          && e.label?.toLowerCase().includes("orchestrator"),
       );
       if (match) return match.sessionId;
 
-      // 3. Last fallback: any other active session (only works for 2-session setups)
-      const other = Object.values(reg).find((e) => e.sessionId !== myId && e.status === "active");
-      return other?.sessionId;
+      return undefined;
     }
     return target;
   }
@@ -290,10 +440,10 @@ export default function (pi: ExtensionAPI) {
     try {
       const piName = pi.getSessionName?.();
       if (piName) {
-        const reg = readRegistry();
-        if (reg[myId] && reg[myId].label !== piName) {
-          reg[myId].label = piName;
-          writeRegistry(reg);
+        const entry = readSessionState(myId);
+        if (entry && entry.label !== piName) {
+          entry.label = piName;
+          writeSessionState(myId, entry);
         }
       }
     } catch {}
@@ -354,16 +504,16 @@ export default function (pi: ExtensionAPI) {
 
   // --- Helper: send message to a target ---
   function sendToTarget(targetInput: string, content: string, msgType: string): string {
-    const reg = readRegistry();
     const targetId = resolveTarget(targetInput);
     const displayName = myDisplayName();
 
     // Also update our label in the registry while we're at it
-    if (reg[myId]) {
+    const myEntry = readSessionState(myId);
+    if (myEntry) {
       const piName = pi.getSessionName?.();
-      if (piName && reg[myId].label !== piName) {
-        reg[myId].label = piName;
-        writeRegistry(reg);
+      if (piName && myEntry.label !== piName) {
+        myEntry.label = piName;
+        writeSessionState(myId, myEntry);
       }
     }
 
@@ -398,7 +548,8 @@ export default function (pi: ExtensionAPI) {
       const sub = parts[0];
 
       if (sub === "list") {
-        const reg = cleanupStale(readRegistry());
+        cleanupStale();
+        const reg = readRegistry();
         const entries = Object.values(reg);
         if (entries.length === 0) return ctx.ui.notify("No dispatch sessions", "info");
         const lines = entries.map((e) => {
@@ -472,7 +623,8 @@ export default function (pi: ExtensionAPI) {
     parameters: Type.Object({}),
     execute: async (_toolCallId) => {
       syncMyLabel();
-      const reg = cleanupStale(readRegistry(), 1); // Auto-cleanup sessions ended >1hr ago
+      cleanupStale(); // Auto-cleanup sessions using default retention window
+      const reg = readRegistry();
       const entries = Object.values(reg);
       if (entries.length === 0) {
         updateWidget();
@@ -518,6 +670,7 @@ export default function (pi: ExtensionAPI) {
       skills: Type.Optional(Type.String({ description: "Comma-separated skills to load (e.g. 'graphite,stack')" })),
     }),
     execute: async (_toolCallId, args) => {
+      const shellEscape = (s: string) => `'${s.replace(/'/g, "'\\''")}'`;
       const taskDir = args.cwd ?? process.cwd();
 
       // Prepend child agent guidelines to the task
@@ -545,27 +698,26 @@ export default function (pi: ExtensionAPI) {
       // Build the pi command — launch normally so all extensions/MCPs/skills auto-discover
       // dispatch.ts is in ~/.pi/agent/extensions/ so it loads automatically
       let piCmd = "pi";
-      if (args.model) piCmd += ` --model '${args.model}'`;
+      if (args.model) piCmd += ` --model ${shellEscape(args.model)}`;
 
       if (args.extensions) {
         for (const ext of args.extensions.split(",").map((s) => s.trim()).filter(Boolean)) {
-          piCmd += ` -e '${ext}'`;
+          piCmd += ` -e ${shellEscape(ext)}`;
         }
       }
 
       if (args.skills) {
         for (const s of args.skills.split(",").map((s) => s.trim()).filter(Boolean)) {
-          piCmd += ` --skill '${s}'`;
+          piCmd += ` --skill ${shellEscape(s)}`;
         }
       }
 
-      // Escape the task for shell
-      const escapedTask = task.replace(/'/g, "'\\''");
-      piCmd += ` '${escapedTask}'`;
+      piCmd += ` ${shellEscape(task)}`;
 
       // Write Python script to temp file to avoid shell escaping issues
       const tmpScript = path.join(DISPATCH_DIR, `_spawn_${Date.now()}.py`);
-      const shellCmd = `cd ${taskDir} && ${piCmd}`;
+      const taskDirEscaped = shellEscape(taskDir);
+      const piCmdStr = piCmd;
       const childName = args.name || undefined;
 
       // Pass spawn metadata to Python so it can write the pending file
@@ -595,7 +747,9 @@ export default function (pi: ExtensionAPI) {
         "    with open(pending_path, 'w') as f:",
         "        json.dump(meta, f)",
         "",
-        `    cmd = ${JSON.stringify(shellCmd)} + chr(13)`,
+        `    task_dir = ${JSON.stringify(taskDirEscaped)}`,
+        `    pi_cmd = ${JSON.stringify(piCmdStr)}`,
+        `    cmd = f"cd {task_dir} && DISPATCH_ITERM_ID='{session.session_id}' {pi_cmd}" + chr(13)`,
         "    await session.async_send_text(cmd)",
         "    print(f'SPAWNED:{session.session_id}')",
         "",
@@ -651,8 +805,7 @@ export default function (pi: ExtensionAPI) {
       target: Type.String({ description: "Session ID to close" }),
     }),
     execute: async (_toolCallId, args) => {
-      const reg = readRegistry();
-      const entry = reg[args.target];
+      const entry = readSessionState(args.target);
 
       if (!entry) {
         return { content: [{ type: "text" as const, text: `Session ${args.target} not found in registry.` }], isError: true };
@@ -666,7 +819,7 @@ export default function (pi: ExtensionAPI) {
           process.kill(entry.pid, "SIGTERM");
           entry.status = "ended";
           entry.endedAt = new Date().toISOString();
-          writeRegistry(reg);
+          writeSessionState(args.target, entry);
           updateWidget();
           return { content: [{ type: "text" as const, text: `Sent SIGTERM to pid ${entry.pid}. No iTerm session ID was recorded.` }] };
         } catch {
@@ -706,7 +859,7 @@ export default function (pi: ExtensionAPI) {
         // Mark as ended in registry
         entry.status = "ended";
         entry.endedAt = new Date().toISOString();
-        writeRegistry(reg);
+        writeSessionState(args.target, entry);
         updateWidget();
 
         if (result.includes("CLOSED:")) {
