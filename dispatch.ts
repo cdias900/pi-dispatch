@@ -29,6 +29,8 @@ import {
   appendMsg, readMsgs, ensureDir,
   sessionDir as _sessionDir,
   isValidEntry,
+  buildSpawnFlags,
+  THINKING_LEVELS,
   type RegistryEntry,
   type Message,
 } from "./dispatch-core.ts";
@@ -660,18 +662,46 @@ export default function (pi: ExtensionAPI) {
   pi.registerTool({
     name: "dispatch_spawn",
     description:
-      "Spawn a new Pi session in a new iTerm2 tab. The child session gets the dispatch extension auto-loaded so it can communicate back. Returns immediately — the child will send a message to your inbox when it's ready.",
+      "Spawn a new Pi session in a new iTerm2 tab. The child session gets the dispatch extension auto-loaded so it can communicate back. Returns immediately — the child will send a message to your inbox when it's ready. Note: dispatch_spawn validates the thinking enum and model syntax but cannot reliably preflight model-specific thinking compatibility; a provider compatibility error may surface asynchronously inside the child after spawn succeeds."
     parameters: Type.Object({
       task: Type.String({ description: "The task/prompt to give the new Pi session" }),
       cwd: Type.Optional(Type.String({ description: "Working directory for the new session (default: current directory)" })),
       name: Type.Optional(Type.String({ description: "Human-readable name for this child session (shown in messages and dispatch_list)" })),
-      model: Type.Optional(Type.String({ description: "Model to use (e.g. 'sonnet', 'opus'). Default: agent default" })),
+      model: Type.Optional(Type.String({
+        description:
+          "Optional model override. Must be an exact native provider-qualified reference of the form \"provider/modelId\" (e.g. \"anthropic/claude-sonnet-5\", \"openai/gpt-5.6-sol\"). Bare or fuzzy aliases such as \"sonnet\" or \"*sonnet*\" are rejected; use the full provider/model form. Do NOT append a thinking suffix like \"provider/model:high\" — use the separate \"thinking\" field instead. Omit to inherit the agent default. Registry existence of the model is still checked by Pi at launch time, not by this tool. Note: when `thinking` is also provided, explicitly supplying `model` improves predictability because the child uses the model you named to determine compatibility; if `model` is omitted the child uses its normal default model, which determines compatibility instead.",
+      })),
+      thinking: Type.Optional(
+        Type.Union(
+          THINKING_LEVELS.map((level) => Type.Literal(level)),
+          {
+            description:
+              "Optional thinking/reasoning level for the spawned session. Must be exactly one of: off, minimal, low, medium, high, xhigh, max. Omit to inherit the agent default. Pi exposes this global set of values, but individual models/providers may support only a subset; dispatch_spawn validates the enum and model syntax but cannot reliably preflight model-specific compatibility (Pi registry metadata can itself be stale or wrong). If `model` is omitted the child uses its normal default model, and that inherited model determines which thinking levels actually work. No compatibility table is maintained here and unsupported levels are not clamped.",
+          },
+        ),
+      ),
       extensions: Type.Optional(Type.String({ description: "Comma-separated additional extensions to load (e.g. 'slack,gworkspace')" })),
       skills: Type.Optional(Type.String({ description: "Comma-separated skills to load (e.g. 'graphite,stack')" })),
     }),
     execute: async (_toolCallId, args) => {
       const shellEscape = (s: string) => `'${s.replace(/'/g, "'\\''")}'`;
       const taskDir = args.cwd ?? process.cwd();
+
+      // Validate model/thinking overrides up front using the pure core helper so
+      // callers get a clear error before we attempt to launch iTerm2/Pi. `undefined`
+      // means omitted; an explicit empty string is invalid and not silently coerced
+      // to a default. The approved dispatch API forbids the native
+      // "provider/model:level" shorthand — callers use the separate `thinking` field.
+      const { flags: spawnFlags, error: spawnFlagError } = buildSpawnFlags({
+        model: args.model,
+        thinking: args.thinking,
+      });
+      if (spawnFlagError) {
+        return {
+          content: [{ type: "text" as const, text: `Invalid spawn options: ${spawnFlagError}` }],
+          isError: true,
+        };
+      }
 
       // Prepend child agent guidelines to the task
       const preamble = [
@@ -698,7 +728,14 @@ export default function (pi: ExtensionAPI) {
       // Build the pi command — launch normally so all extensions/MCPs/skills auto-discover
       // dispatch.ts is in ~/.pi/agent/extensions/ so it loads automatically
       let piCmd = "pi";
-      if (args.model) piCmd += ` --model ${shellEscape(args.model)}`;
+      // Append --model <value> and/or --thinking <level> only when supplied.
+      // spawnFlags is an ordered token list (e.g. ["--model", "anthropic/...",
+      // "--thinking", "high"]); shellEscape every forwarded value.
+      for (let i = 0; i < spawnFlags.length; i += 2) {
+        const flagName = spawnFlags[i];
+        const flagValue = spawnFlags[i + 1];
+        piCmd += ` ${flagName} ${shellEscape(flagValue)}`;
+      }
 
       if (args.extensions) {
         for (const ext of args.extensions.split(",").map((s) => s.trim()).filter(Boolean)) {

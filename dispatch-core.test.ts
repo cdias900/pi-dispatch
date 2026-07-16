@@ -6,17 +6,21 @@ import * as path from "path";
 
 import {
   appendMsg,
+  buildSpawnFlags,
   cleanupStale,
   ensureDir,
   isValidEntry,
+  isValidThinkingLevel,
   migrateRegistryIfNeeded,
   readMsgs,
   readRegistry,
   readSessionState,
   sessionDir,
+  THINKING_LEVELS,
+  validateModelOverride,
   writeSessionState,
 } from "./dispatch-core.ts";
-import type { Message, RegistryEntry } from "./dispatch-core.ts";
+import type { Message, RegistryEntry, ThinkingLevel } from "./dispatch-core.ts";
 
 function createTmpDir(): string {
   return fs.mkdtempSync(path.join(os.tmpdir(), "dispatch-test-"));
@@ -554,6 +558,261 @@ describe("session isolation", () => {
     assert.deepEqual(readRegistry(dispatchDir), {
       [updatedFirst.sessionId]: updatedFirst,
       [second.sessionId]: second,
+    });
+  });
+});
+
+describe("THINKING_LEVELS and isValidThinkingLevel", () => {
+  it("exports the seven authoritative Pi 0.80.7 thinking levels", () => {
+    assert.deepEqual([...THINKING_LEVELS], [
+      "off",
+      "minimal",
+      "low",
+      "medium",
+      "high",
+      "xhigh",
+      "max",
+    ]);
+  });
+
+  for (const level of THINKING_LEVELS) {
+    it(`accepts "${level}" as a valid thinking level`, () => {
+      assert.equal(isValidThinkingLevel(level), true);
+    });
+  }
+
+  it("rejects an invalid thinking level string", () => {
+    assert.equal(isValidThinkingLevel("ultra"), false);
+  });
+
+  it("rejects an empty string", () => {
+    assert.equal(isValidThinkingLevel(""), false);
+  });
+
+  it("rejects non-string values", () => {
+    assert.equal(isValidThinkingLevel(undefined), false);
+    assert.equal(isValidThinkingLevel(null), false);
+    assert.equal(isValidThinkingLevel(42), false);
+  });
+
+  it("is a type guard for ThinkingLevel", () => {
+    const value: unknown = "high";
+    assert.equal(isValidThinkingLevel(value), true);
+    // exercise the type-guard branch
+    if (isValidThinkingLevel(value)) {
+      const _typed: ThinkingLevel = value;
+      assert.equal(_typed, "high");
+    }
+  });
+});
+
+describe("validateModelOverride", () => {
+  it("accepts undefined (no override)", () => {
+    assert.deepEqual(validateModelOverride(undefined), { ok: true });
+  });
+
+  it("accepts a real provider-qualified id", () => {
+    assert.deepEqual(validateModelOverride("openai/gpt-5.6-sol"), { ok: true });
+    assert.deepEqual(validateModelOverride("anthropic/claude-sonnet-5"), { ok: true });
+  });
+
+  it("accepts a nested model id with additional slash segments", () => {
+    assert.deepEqual(validateModelOverride("openrouter/anthropic/claude-sonnet-4"), { ok: true });
+  });
+
+  it("accepts model ids with punctuation (dots, dashes, colons that are not thinking suffixes)", () => {
+    assert.deepEqual(validateModelOverride("openai/gpt-4o-mini"), { ok: true });
+    assert.deepEqual(validateModelOverride("openrouter/qwen/qwen3-coder:exacto"), { ok: true });
+  });
+
+  it("rejects an empty string (distinct from undefined)", () => {
+    const result = validateModelOverride("");
+    assert.equal(result.ok, false);
+    if (!result.ok) {
+      assert.match(result.reason, /empty/);
+    }
+  });
+
+  it("rejects a non-string value", () => {
+    const result = validateModelOverride(123);
+    assert.equal(result.ok, false);
+    if (!result.ok) {
+      assert.match(result.reason, /string/);
+    }
+  });
+
+  it("rejects surrounding whitespace", () => {
+    const result = validateModelOverride(" openai/gpt-5");
+    assert.equal(result.ok, false);
+    if (!result.ok) {
+      assert.match(result.reason, /whitespace/);
+    }
+  });
+
+  it("rejects trailing whitespace", () => {
+    const result = validateModelOverride("openai/gpt-5 ");
+    assert.equal(result.ok, false);
+    if (!result.ok) {
+      assert.match(result.reason, /whitespace/);
+    }
+  });
+
+  it("rejects internal whitespace", () => {
+    const result = validateModelOverride("openai /gpt-5");
+    assert.equal(result.ok, false);
+    if (!result.ok) {
+      assert.match(result.reason, /whitespace/);
+    }
+  });
+
+  it("rejects a bare alias with no slash", () => {
+    const result = validateModelOverride("sonnet");
+    assert.equal(result.ok, false);
+    if (!result.ok) {
+      assert.match(result.reason, /provider-qualified/);
+    }
+  });
+
+  it("rejects a fuzzy alias with no slash", () => {
+    const result = validateModelOverride("*sonnet*");
+    assert.equal(result.ok, false);
+    if (!result.ok) {
+      assert.match(result.reason, /provider-qualified/);
+    }
+  });
+
+  it("rejects a leading slash with no provider", () => {
+    const result = validateModelOverride("/gpt-5");
+    assert.equal(result.ok, false);
+    if (!result.ok) {
+      assert.match(result.reason, /provider/);
+    }
+  });
+
+  it("rejects a trailing slash with no model id", () => {
+    const result = validateModelOverride("openai/");
+    assert.equal(result.ok, false);
+    if (!result.ok) {
+      assert.match(result.reason, /model id/);
+    }
+  });
+
+  it("rejects a trailing :high thinking suffix and points to the thinking field", () => {
+    const result = validateModelOverride("openai/gpt-5:high");
+    assert.equal(result.ok, false);
+    if (!result.ok) {
+      assert.match(result.reason, /thinking suffix/);
+      assert.match(result.reason, /'thinking' field/);
+    }
+  });
+
+  it("rejects every thinking level used as a trailing suffix", () => {
+    for (const level of THINKING_LEVELS) {
+      const result = validateModelOverride(`anthropic/claude-sonnet-5:${level}`);
+      assert.equal(result.ok, false, `expected :${level} to be rejected`);
+      if (!result.ok) {
+        assert.match(result.reason, /thinking suffix/);
+      }
+    }
+  });
+
+  it("rejects anthropic/claude-sonnet-5:off as a thinking suffix and directs to the thinking field", () => {
+    const result = validateModelOverride("anthropic/claude-sonnet-5:off");
+    assert.equal(result.ok, false);
+    if (!result.ok) {
+      assert.match(result.reason, /thinking suffix/);
+      assert.match(result.reason, /'thinking' field/);
+      assert.match(result.reason, /:off/);
+    }
+  });
+
+  it("does not reject a colon suffix that is not a thinking level", () => {
+    assert.deepEqual(validateModelOverride("openrouter/qwen/qwen3-coder:exacto"), { ok: true });
+  });
+});
+
+describe("buildSpawnFlags", () => {
+  it("emits no flags when neither model nor thinking is supplied", () => {
+    assert.deepEqual(buildSpawnFlags({}), { flags: [], error: undefined });
+  });
+
+  it("treats undefined model as omitted (no --model flag)", () => {
+    assert.deepEqual(buildSpawnFlags({ model: undefined, thinking: "high" }), {
+      flags: ["--thinking", "high"],
+      error: undefined,
+    });
+  });
+
+  it("emits only --model when model is supplied without thinking", () => {
+    assert.deepEqual(buildSpawnFlags({ model: "anthropic/claude-sonnet-5" }), {
+      flags: ["--model", "anthropic/claude-sonnet-5"],
+      error: undefined,
+    });
+  });
+
+  it("emits only --thinking when thinking is supplied without model", () => {
+    assert.deepEqual(buildSpawnFlags({ thinking: "low" }), {
+      flags: ["--thinking", "low"],
+      error: undefined,
+    });
+  });
+
+  it("emits both --model and --thinking when both are supplied", () => {
+    assert.deepEqual(
+      buildSpawnFlags({ model: "openai/gpt-5.6-sol", thinking: "xhigh" }),
+      { flags: ["--model", "openai/gpt-5.6-sol", "--thinking", "xhigh"], error: undefined },
+    );
+  });
+
+  it("emits flags for all seven thinking levels", () => {
+    for (const level of THINKING_LEVELS) {
+      assert.deepEqual(buildSpawnFlags({ thinking: level }), {
+        flags: ["--thinking", level],
+        error: undefined,
+      });
+    }
+  });
+
+  it("returns an error and no flags for an invalid model", () => {
+    const result = buildSpawnFlags({ model: "sonnet", thinking: "high" });
+    assert.deepEqual(result.flags, []);
+    assert.ok(result.error);
+    assert.match(result.error!, /provider-qualified/);
+  });
+
+  it("returns an error and no flags for an empty model string", () => {
+    const result = buildSpawnFlags({ model: "" });
+    assert.deepEqual(result.flags, []);
+    assert.ok(result.error);
+    assert.match(result.error!, /empty/);
+  });
+
+  it("returns an error and no flags for a model with a :high suffix", () => {
+    const result = buildSpawnFlags({ model: "openai/gpt-5:high" });
+    assert.deepEqual(result.flags, []);
+    assert.ok(result.error);
+    assert.match(result.error!, /thinking suffix/);
+  });
+
+  it("returns an error and no flags for an invalid thinking level", () => {
+    const result = buildSpawnFlags({ model: "openai/gpt-5", thinking: "ultra" });
+    assert.deepEqual(result.flags, []);
+    assert.ok(result.error);
+    assert.match(result.error!, /invalid thinking level/);
+    assert.match(result.error!, /ultra/);
+  });
+
+  it("returns an error and no flags for an empty thinking string", () => {
+    const result = buildSpawnFlags({ thinking: "" });
+    assert.deepEqual(result.flags, []);
+    assert.ok(result.error);
+    assert.match(result.error!, /invalid thinking level/);
+  });
+
+  it("emits --model for a nested model id", () => {
+    assert.deepEqual(buildSpawnFlags({ model: "openrouter/anthropic/claude-sonnet-4" }), {
+      flags: ["--model", "openrouter/anthropic/claude-sonnet-4"],
+      error: undefined,
     });
   });
 });

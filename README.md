@@ -62,6 +62,56 @@ dispatch_spawn(
 )
 ```
 
+#### Parameters
+
+| Parameter | Required | Description |
+|-----------|----------|-------------|
+| `task` | **Yes** | The task/prompt to give the new Pi session. |
+| `cwd` | No | Working directory for the new session (default: current directory). |
+| `name` | No | Human-readable name for this child session (shown in messages and `dispatch_list`). |
+| `model` | No | Optional model override. Must be an **exact native `provider/model`** reference (e.g. `anthropic/claude-sonnet-5`, `openai/gpt-5.6-sol`). Bare or fuzzy aliases like `sonnet` or `*sonnet*` are rejected. Do **not** append a thinking suffix (`provider/model:high`) — use the `thinking` field instead. Omit to inherit the agent default. Registry existence is still checked by Pi at launch. |
+| `thinking` | No | Optional thinking/reasoning level. Exactly one of: `off`, `minimal`, `low`, `medium`, `high`, `xhigh`, `max`. Omit to inherit the agent default. |
+| `extensions` | No | Comma-separated additional extensions to load (e.g. `slack,gworkspace`). |
+| `skills` | No | Comma-separated skills to load (e.g. `graphite,stack`). |
+
+`model` and `thinking` are both optional. Omitting either inherits the agent default; an explicit empty string is invalid and fails validation rather than silently falling back. The native `provider/model:level` shorthand is **not** accepted — use the separate `thinking` field.
+
+#### Thinking compatibility
+
+Pi exposes a **global** set of thinking levels (`off`, `minimal`, `low`, `medium`, `high`, `xhigh`, `max`), but individual models/providers may support only a subset. `dispatch_spawn` validates the `thinking` enum and `model` syntax, but it **cannot reliably preflight model-specific compatibility** — Pi registry metadata can itself be stale or wrong.
+
+When `thinking` is provided **without** `model`, the spawned child uses its normal default model, and that inherited model determines which levels actually work. `dispatch_spawn` returns immediately after launching the tab; a provider compatibility error may surface **asynchronously** inside the child after spawn succeeds.
+
+> **Recommendation:** when choosing a `thinking` override, explicitly provide `model` and use a thinking level known to be supported by that model. This improves predictability because the child uses the model you named to determine compatibility — but it does **not** guarantee preflight validation, since compatibility is enforced by the provider, not by this tool.
+
+#### Examples
+
+```
+// Default model and thinking
+dispatch_spawn(task: "Fix the failing tests in PR #123")
+
+// Override the model only (thinking inherits the default)
+dispatch_spawn(
+  task: "Refactor the auth module",
+  model: "anthropic/claude-sonnet-5"
+)
+
+// Override thinking only (model inherits the default)
+dispatch_spawn(
+  task: "Investigate the flaky CI",
+  thinking: "xhigh"
+)
+
+// Override both
+dispatch_spawn(
+  task: "Design the new caching layer",
+  model: "openai/gpt-5.6-sol",
+  thinking: "high"
+)
+```
+
+Valid `thinking` levels: `off`, `minimal`, `low`, `medium`, `high`, `xhigh`, `max`.
+
 Children are automatically instructed to:
 1. Register and send a "ready" status back
 2. Use subagents (scout/planner/executor/reviewer) for work
