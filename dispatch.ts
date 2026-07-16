@@ -662,7 +662,7 @@ export default function (pi: ExtensionAPI) {
   pi.registerTool({
     name: "dispatch_spawn",
     description:
-      "Spawn a new Pi session in a new iTerm2 tab. The child session gets the dispatch extension auto-loaded so it can communicate back. Returns immediately — the child will send a message to your inbox when it's ready. Note: dispatch_spawn validates the thinking enum and model syntax but cannot reliably preflight model-specific thinking compatibility; a provider compatibility error may surface asynchronously inside the child after spawn succeeds."
+      "Spawn a new Pi session in a new iTerm2 tab. The child session gets the dispatch extension auto-loaded so it can communicate back. Returns immediately — the child will send a message to your inbox when it's ready. Note: dispatch_spawn validates the thinking enum and model syntax but cannot reliably preflight model-specific thinking compatibility; a provider compatibility error may surface asynchronously inside the child after spawn succeeds.",
     parameters: Type.Object({
       task: Type.String({ description: "The task/prompt to give the new Pi session" }),
       cwd: Type.Optional(Type.String({ description: "Working directory for the new session (default: current directory)" })),

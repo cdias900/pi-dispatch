@@ -816,3 +816,10 @@ describe("buildSpawnFlags", () => {
     });
   });
 });
+
+describe("dispatch extension module", () => {
+  it("imports successfully", async () => {
+    const extension = await import("./dispatch.ts");
+    assert.ok(extension);
+  });
+});
