@@ -6,21 +6,37 @@ import * as path from "path";
 
 import {
   appendMsg,
+  buildPiArgs,
+  buildPiCommand,
   buildSpawnFlags,
   cleanupStale,
   ensureDir,
+  isPendingSpawnRecord,
+  isTerminalLocation,
   isValidEntry,
+  isValidSpawnToken,
   isValidThinkingLevel,
   migrateRegistryIfNeeded,
+  pendingSpawnPath,
   readMsgs,
+  readPendingSpawn,
   readRegistry,
   readSessionState,
+  resolveSpawnCwd,
   sessionDir,
+  shellEscape,
   THINKING_LEVELS,
   validateModelOverride,
+  writePendingSpawn,
   writeSessionState,
 } from "./dispatch-core.ts";
-import type { Message, RegistryEntry, ThinkingLevel } from "./dispatch-core.ts";
+import type {
+  Message,
+  PendingSpawnRecord,
+  RegistryEntry,
+  TerminalLocation,
+  ThinkingLevel,
+} from "./dispatch-core.ts";
 
 function createTmpDir(): string {
   return fs.mkdtempSync(path.join(os.tmpdir(), "dispatch-test-"));
@@ -814,6 +830,137 @@ describe("buildSpawnFlags", () => {
       flags: ["--model", "openrouter/anthropic/claude-sonnet-4"],
       error: undefined,
     });
+  });
+});
+
+describe("terminal location metadata", () => {
+  const locations: TerminalLocation[] = [
+    { kind: "iterm2", sessionId: "session-123" },
+    {
+      kind: "herdr",
+      socketPath: "/tmp/herdr.sock",
+      binaryPath: "/opt/bin/herdr",
+      workspaceId: "w1",
+      tabId: "w1:t2",
+      paneId: "w1:p3",
+    },
+  ];
+
+  it("accepts complete iTerm2 and Herdr locations", () => {
+    for (const location of locations) assert.equal(isTerminalLocation(location), true);
+  });
+
+  it("rejects incomplete or unknown terminal locations", () => {
+    assert.equal(isTerminalLocation({ kind: "iterm2", sessionId: "" }), false);
+    assert.equal(isTerminalLocation({ kind: "herdr", socketPath: "/tmp/s" }), false);
+    assert.equal(isTerminalLocation({ kind: "tmux", paneId: "%1" }), false);
+  });
+
+  it("round-trips terminal metadata through session state", () => {
+    const dispatchDir = getDispatchDir();
+    const entry = validEntry({ sessionId: "herdr-child", terminal: locations[1] });
+    writeSessionState(entry.sessionId, entry, dispatchDir);
+    assert.deepEqual(readSessionState(entry.sessionId, dispatchDir), entry);
+  });
+});
+
+describe("pending spawn metadata", () => {
+  function pendingRecord(): PendingSpawnRecord {
+    return {
+      spawnedBy: "parent-1",
+      name: "worker",
+      terminal: {
+        kind: "herdr",
+        socketPath: "/tmp/herdr.sock",
+        workspaceId: "w1",
+        tabId: "w1:t2",
+        paneId: "w1:p2",
+      },
+    };
+  }
+
+  it("validates portable opaque spawn tokens", () => {
+    assert.equal(isValidSpawnToken("1e8d692b-8b88-4af5_a"), true);
+    assert.equal(isValidSpawnToken(""), false);
+    assert.equal(isValidSpawnToken("../escape"), false);
+    assert.equal(isValidSpawnToken("has spaces"), false);
+  });
+
+  it("round-trips an atomically written exact pending record", () => {
+    const dispatchDir = getDispatchDir();
+    const token = "token-123";
+    const filePath = writePendingSpawn(dispatchDir, token, pendingRecord());
+
+    assert.equal(filePath, pendingSpawnPath(dispatchDir, token));
+    assert.deepEqual(readPendingSpawn(dispatchDir, token), {
+      path: filePath,
+      record: pendingRecord(),
+    });
+    assert.deepEqual(fs.readdirSync(dispatchDir).filter((name) => name.includes(".tmp.")), []);
+  });
+
+  it("rejects invalid records and never allows token path traversal", () => {
+    assert.equal(isPendingSpawnRecord({ spawnedBy: "parent", terminal: { kind: "herdr" } }), false);
+    assert.throws(() => pendingSpawnPath(getDispatchDir(), "../escape"), /invalid dispatch spawn token/);
+    assert.throws(
+      () => writePendingSpawn(getDispatchDir(), "good-token", { spawnedBy: "" } as PendingSpawnRecord),
+      /invalid pending dispatch spawn record/,
+    );
+  });
+
+  it("returns undefined for missing, malformed, or invalid-token pending records", () => {
+    const dispatchDir = getDispatchDir();
+    ensureDir(dispatchDir);
+    fs.writeFileSync(path.join(dispatchDir, "_pending_spawn_bad.json"), "not-json");
+    assert.equal(readPendingSpawn(dispatchDir, "missing"), undefined);
+    assert.equal(readPendingSpawn(dispatchDir, "bad"), undefined);
+    assert.equal(readPendingSpawn(dispatchDir, "../bad"), undefined);
+  });
+});
+
+describe("spawn command helpers", () => {
+  it("resolves default, relative, absolute, and home-relative working directories", () => {
+    assert.equal(resolveSpawnCwd(undefined, "/repo/app", "/home/me"), path.resolve("/repo/app"));
+    assert.equal(resolveSpawnCwd("tests", "/repo/app", "/home/me"), path.resolve("/repo/app/tests"));
+    assert.equal(resolveSpawnCwd("/tmp/work", "/repo/app", "/home/me"), path.resolve("/tmp/work"));
+    assert.equal(resolveSpawnCwd("~", "/repo/app", "/home/me"), path.resolve("/home/me"));
+    assert.equal(resolveSpawnCwd("~/work", "/repo/app", "/home/me"), path.resolve("/home/me/work"));
+  });
+
+  it("shell-escapes single quotes", () => {
+    assert.equal(shellEscape("a'b"), "'a'\\''b'");
+  });
+
+  it("builds argv for Herdr agent start without shell interpolation", () => {
+    assert.deepEqual(buildPiArgs({
+      flags: ["--model", "openai/gpt-5.6-sol", "--thinking", "high"],
+      extensions: "slack, path with spaces",
+      skills: "graphite,stack",
+    }), [
+      "--model", "openai/gpt-5.6-sol",
+      "--thinking", "high",
+      "-e", "slack",
+      "-e", "path with spaces",
+      "--skill", "graphite",
+      "--skill", "stack",
+    ]);
+  });
+
+  it("builds one safely quoted Pi command with optional resources", () => {
+    const command = buildPiCommand({
+      task: "review $(touch /tmp/nope) and it's done\nnext line",
+      flags: ["--model", "openai/gpt-5.6-sol", "--thinking", "high"],
+      extensions: "slack, path with spaces",
+      skills: "graphite,stack",
+    });
+    assert.equal(
+      command,
+      "pi '--model' 'openai/gpt-5.6-sol' '--thinking' 'high' '-e' 'slack' '-e' 'path with spaces' '--skill' 'graphite' '--skill' 'stack' 'review $(touch /tmp/nope) and it'\\''s done\nnext line'",
+    );
+  });
+
+  it("rejects an odd spawn flag list", () => {
+    assert.throws(() => buildPiCommand({ task: "x", flags: ["--model"] }), /flag\/value pairs/);
   });
 });
 

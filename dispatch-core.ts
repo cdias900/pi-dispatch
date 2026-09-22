@@ -115,7 +115,7 @@ export function buildSpawnFlags(options: {
   thinking?: string;
 }): SpawnFlagResult {
   const modelResult = validateModelOverride(options.model);
-  if (!modelResult.ok) {
+  if (modelResult.ok === false) {
     return { flags: [], error: modelResult.reason };
   }
 
@@ -141,6 +141,151 @@ export function buildSpawnFlags(options: {
   return { flags, error: undefined };
 }
 
+export interface ITermTerminalLocation {
+  kind: "iterm2";
+  sessionId: string;
+}
+
+export interface HerdrTerminalLocation {
+  kind: "herdr";
+  socketPath: string;
+  binaryPath?: string;
+  workspaceId: string;
+  tabId: string;
+  paneId: string;
+}
+
+export type TerminalLocation = ITermTerminalLocation | HerdrTerminalLocation;
+
+export function isTerminalLocation(value: unknown): value is TerminalLocation {
+  if (!value || typeof value !== "object") return false;
+  const location = value as Record<string, unknown>;
+  if (location.kind === "iterm2") {
+    return typeof location.sessionId === "string" && location.sessionId.length > 0;
+  }
+  if (location.kind === "herdr") {
+    return typeof location.socketPath === "string" && location.socketPath.length > 0
+      && (location.binaryPath === undefined
+        || (typeof location.binaryPath === "string" && location.binaryPath.length > 0))
+      && typeof location.workspaceId === "string" && location.workspaceId.length > 0
+      && typeof location.tabId === "string" && location.tabId.length > 0
+      && typeof location.paneId === "string" && location.paneId.length > 0;
+  }
+  return false;
+}
+
+export interface PendingSpawnRecord {
+  spawnedBy: string;
+  name?: string;
+  terminal: TerminalLocation;
+}
+
+const SPAWN_TOKEN_PATTERN = /^[A-Za-z0-9_-]{1,128}$/;
+
+export function isValidSpawnToken(value: unknown): value is string {
+  return typeof value === "string" && SPAWN_TOKEN_PATTERN.test(value);
+}
+
+export function pendingSpawnPath(dispatchDir: string, token: string): string {
+  if (!isValidSpawnToken(token)) {
+    throw new Error("invalid dispatch spawn token");
+  }
+  return path.join(dispatchDir, `_pending_spawn_${token}.json`);
+}
+
+export function isPendingSpawnRecord(value: unknown): value is PendingSpawnRecord {
+  if (!value || typeof value !== "object") return false;
+  const record = value as Record<string, unknown>;
+  return typeof record.spawnedBy === "string" && record.spawnedBy.length > 0
+    && (record.name === undefined || typeof record.name === "string")
+    && isTerminalLocation(record.terminal);
+}
+
+export function writePendingSpawn(
+  dispatchDir: string,
+  token: string,
+  record: PendingSpawnRecord,
+): string {
+  if (!isPendingSpawnRecord(record)) {
+    throw new Error("invalid pending dispatch spawn record");
+  }
+  ensureDir(dispatchDir);
+  const target = pendingSpawnPath(dispatchDir, token);
+  const tmp = `${target}.tmp.${process.pid}`;
+  try {
+    fs.writeFileSync(tmp, JSON.stringify(record, null, 2), { mode: 0o600 });
+    fs.renameSync(tmp, target);
+    return target;
+  } catch (error) {
+    try { fs.rmSync(tmp, { force: true }); } catch {}
+    throw error;
+  }
+}
+
+export function readPendingSpawn(
+  dispatchDir: string,
+  token: unknown,
+): { path: string; record: PendingSpawnRecord } | undefined {
+  if (!isValidSpawnToken(token)) return undefined;
+  try {
+    const filePath = pendingSpawnPath(dispatchDir, token);
+    const value = JSON.parse(fs.readFileSync(filePath, "utf-8"));
+    return isPendingSpawnRecord(value) ? { path: filePath, record: value } : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+export function resolveSpawnCwd(
+  requestedCwd: string | undefined,
+  currentCwd: string,
+  homeDir: string,
+): string {
+  if (!requestedCwd) return path.resolve(currentCwd);
+  if (requestedCwd === "~") return path.resolve(homeDir);
+  if (requestedCwd.startsWith("~/") || requestedCwd.startsWith("~\\")) {
+    return path.resolve(homeDir, requestedCwd.slice(2));
+  }
+  return path.resolve(currentCwd, requestedCwd);
+}
+
+export function shellEscape(value: string): string {
+  return `'${value.replace(/'/g, "'\\''")}'`;
+}
+
+export function buildPiArgs(options: {
+  flags: string[];
+  extensions?: string;
+  skills?: string;
+}): string[] {
+  const args: string[] = [];
+  for (let i = 0; i < options.flags.length; i += 2) {
+    const flagName = options.flags[i];
+    const flagValue = options.flags[i + 1];
+    if (!flagName || flagValue === undefined) {
+      throw new Error("spawn flags must be flag/value pairs");
+    }
+    args.push(flagName, flagValue);
+  }
+  for (const extension of options.extensions?.split(",").map((value) => value.trim()).filter(Boolean) ?? []) {
+    args.push("-e", extension);
+  }
+  for (const skill of options.skills?.split(",").map((value) => value.trim()).filter(Boolean) ?? []) {
+    args.push("--skill", skill);
+  }
+  return args;
+}
+
+export function buildPiCommand(options: {
+  task: string;
+  flags: string[];
+  extensions?: string;
+  skills?: string;
+}): string {
+  const args = [...buildPiArgs(options), options.task];
+  return `pi ${args.map(shellEscape).join(" ")}`;
+}
+
 export interface RegistryEntry {
   sessionId: string;
   cwd: string;
@@ -149,6 +294,8 @@ export interface RegistryEntry {
   endedAt?: string;
   status: "active" | "ended";
   label?: string;
+  terminal?: TerminalLocation;
+  /** Legacy iTerm2 handle retained for existing state files. */
   itermSessionId?: string;
   spawnedBy?: string;
 }

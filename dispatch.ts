@@ -19,7 +19,7 @@ import * as path from "node:path";
 import { execSync } from "node:child_process";
 import type { ExtensionAPI } from "@mariozechner/pi-coding-agent";
 import { Type } from "@sinclair/typebox";
-import { Box, Container, Text } from "@mariozechner/pi-tui";
+import { Box, Text } from "@mariozechner/pi-tui";
 import {
   readRegistry as _readRegistry,
   writeSessionState as _writeSessionState,
@@ -28,12 +28,24 @@ import {
   migrateRegistryIfNeeded as _migrateRegistryIfNeeded,
   appendMsg, readMsgs, ensureDir,
   sessionDir as _sessionDir,
-  isValidEntry,
+  buildPiArgs,
+  buildPiCommand,
   buildSpawnFlags,
+  isTerminalLocation,
+  readPendingSpawn,
+  resolveSpawnCwd,
+  shellEscape,
   THINKING_LEVELS,
+  type PendingSpawnRecord,
   type RegistryEntry,
   type Message,
+  type TerminalLocation,
 } from "./dispatch-core.ts";
+import {
+  closeHerdrTab,
+  isHerdrEnvironment,
+  spawnHerdrChild,
+} from "./dispatch-herdr.ts";
 
 const DISPATCH_DIR = path.join(os.homedir(), ".pi", "dispatch");
 const ITERM_PY = path.join(os.homedir(), ".local", "iterm2-env", "bin", "python3");
@@ -53,8 +65,84 @@ interface DispatchPersistedState {
   myId: string;
   spawnedBy?: string;
   label?: string;
+  terminal?: TerminalLocation;
   itermSessionId?: string;
   lastInboxCount: number;
+}
+
+interface PendingClaim {
+  path: string;
+  record: PendingSpawnRecord;
+}
+
+function matchingPendingSpawn(): PendingClaim | undefined {
+  const claim = readPendingSpawn(DISPATCH_DIR, process.env.DISPATCH_SPAWN_TOKEN);
+  if (!claim) return undefined;
+  const terminal = claim.record.terminal;
+  if (terminal.kind === "herdr") {
+    if (process.env.HERDR_ENV !== "1"
+      || process.env.HERDR_SOCKET_PATH !== terminal.socketPath
+      || process.env.HERDR_WORKSPACE_ID !== terminal.workspaceId
+      || process.env.HERDR_TAB_ID !== terminal.tabId
+      || process.env.HERDR_PANE_ID !== terminal.paneId) {
+      return undefined;
+    }
+    return claim;
+  }
+  return process.env.DISPATCH_ITERM_ID === terminal.sessionId ? claim : undefined;
+}
+
+function applyPendingRecord(entry: RegistryEntry, claim: PendingClaim): void {
+  entry.terminal = claim.record.terminal;
+  if (claim.record.terminal.kind === "iterm2") {
+    entry.itermSessionId = claim.record.terminal.sessionId;
+  }
+  entry.spawnedBy = claim.record.spawnedBy;
+  if (claim.record.name) entry.label = claim.record.name;
+}
+
+function applyLegacyITermPending(entry: RegistryEntry): string | undefined {
+  const myItermId = process.env.DISPATCH_ITERM_ID;
+  if (myItermId) {
+    const filePath = path.join(DISPATCH_DIR, `_pending_iterm_${myItermId}.json`);
+    if (!fs.existsSync(filePath)) return undefined;
+    const data = JSON.parse(fs.readFileSync(filePath, "utf-8")) as {
+      spawnedBy?: string;
+      name?: string;
+    };
+    entry.itermSessionId = myItermId;
+    entry.terminal = { kind: "iterm2", sessionId: myItermId };
+    entry.spawnedBy = data.spawnedBy;
+    if (data.name) entry.label = data.name;
+    return filePath;
+  }
+
+  // Legacy fallback retained for old iTerm spawns that did not export an exact id.
+  const pendingFiles = fs.readdirSync(DISPATCH_DIR).filter((file) => file.startsWith("_pending_iterm_"));
+  for (const file of pendingFiles) {
+    const filePath = path.join(DISPATCH_DIR, file);
+    const data = JSON.parse(fs.readFileSync(filePath, "utf-8")) as {
+      itermSessionId?: string;
+      spawnedBy?: string;
+      name?: string;
+    };
+    if (!data.itermSessionId) continue;
+    entry.itermSessionId = data.itermSessionId;
+    entry.terminal = { kind: "iterm2", sessionId: data.itermSessionId };
+    entry.spawnedBy = data.spawnedBy;
+    if (data.name) entry.label = data.name;
+    return filePath;
+  }
+  return undefined;
+}
+
+function unlinkClaim(filePath: string | undefined): void {
+  if (!filePath) return;
+  try { fs.unlinkSync(filePath); } catch {}
+}
+
+function processIsAlive(pid: number): boolean {
+  try { process.kill(pid, 0); return true; } catch { return false; }
 }
 
 export default function (pi: ExtensionAPI) {
@@ -107,9 +195,11 @@ export default function (pi: ExtensionAPI) {
     const candidateId = `anon-${process.pid}`;
     let savedState: DispatchPersistedState | undefined;
     let reclaimedFrom: RegistryEntry | undefined;
+    let pendingClaimPath: string | undefined;
 
     try {
       migrateRegistryIfNeeded();
+      const exactPendingClaim = matchingPendingSpawn();
 
       // On reload, restore identity from globalThis (survives module reimport)
       if (event.reason === "reload") {
@@ -122,8 +212,11 @@ export default function (pi: ExtensionAPI) {
       // Always clean up globalThis to prevent stale carry-over
       delete (globalThis as any)[DISPATCH_GLOBAL_KEY];
 
-      // Determine our dispatch ID. On /resume, try to reclaim our previous ID
-      // so children's spawnedBy references still work.
+      // Determine our dispatch ID. Exactly correlated children always keep their
+      // new pid-based identity; only ordinary /resume flows may reclaim an old id.
+      if (!myId && exactPendingClaim) {
+        myId = candidateId;
+      }
       if (!myId) {
         const existingReg = readRegistry();
         const RECLAIM_WINDOW_MS = 60_000;
@@ -196,44 +289,31 @@ export default function (pi: ExtensionAPI) {
       if (savedState) {
         if (savedState.spawnedBy) entry.spawnedBy = savedState.spawnedBy;
         if (savedState.label) entry.label = savedState.label;
+        if (savedState.terminal) entry.terminal = savedState.terminal;
         if (savedState.itermSessionId) entry.itermSessionId = savedState.itermSessionId;
       } else if (existingEntry) {
         if (existingEntry.spawnedBy) entry.spawnedBy = existingEntry.spawnedBy;
         if (existingEntry.label) entry.label = existingEntry.label;
+        if (existingEntry.terminal) entry.terminal = existingEntry.terminal;
         if (existingEntry.itermSessionId) entry.itermSessionId = existingEntry.itermSessionId;
       }
 
-      // Only claim pending spawn metadata on fresh starts (not reloads or reclaims with existing metadata)
+      // Only claim pending spawn metadata on fresh starts. Keep the pending file
+      // until state.json is durable so a failed registration can retry safely.
       if (!savedState && !entry.spawnedBy) {
         try {
-          const myItermId = process.env.DISPATCH_ITERM_ID;
-          if (myItermId) {
-            // Exact match via env var — deterministic correlation
-            const pfPath = path.join(DISPATCH_DIR, `_pending_iterm_${myItermId}.json`);
-            if (fs.existsSync(pfPath)) {
-              const data = JSON.parse(fs.readFileSync(pfPath, "utf-8"));
-              entry.itermSessionId = myItermId;
-              entry.spawnedBy = data.spawnedBy;
-              if (data.name) entry.label = data.name;
-              fs.unlinkSync(pfPath);
-            }
+          if (exactPendingClaim) {
+            applyPendingRecord(entry, exactPendingClaim);
+            pendingClaimPath = exactPendingClaim.path;
           } else {
-            // Fallback for manually-started sessions: claim first pending file
-            const pendingFiles = fs.readdirSync(DISPATCH_DIR).filter((f) => f.startsWith("_pending_iterm_"));
-            for (const pf of pendingFiles) {
-              const pfPath = path.join(DISPATCH_DIR, pf);
-              const data = JSON.parse(fs.readFileSync(pfPath, "utf-8"));
-              entry.itermSessionId = data.itermSessionId;
-              entry.spawnedBy = data.spawnedBy;
-              if (data.name) entry.label = data.name;
-              fs.unlinkSync(pfPath);
-              break;
-            }
+            pendingClaimPath = applyLegacyITermPending(entry);
           }
         } catch {}
       }
 
       writeSessionState(myId, entry);
+      unlinkClaim(pendingClaimPath);
+      pendingClaimPath = undefined;
 
       // Skip old inbox messages
       if (savedState) {
@@ -353,27 +433,32 @@ export default function (pi: ExtensionAPI) {
         if (!fs.existsSync(inboxPath)) fs.writeFileSync(inboxPath, "");
         if (!fs.existsSync(outboxPath)) fs.writeFileSync(outboxPath, "");
 
-        // Best-effort: register in registry so we're at least discoverable
+        // Best-effort: preserve any state already written, or claim exact spawn
+        // metadata again when the primary registration failed before commit.
         try {
-          const fallbackEntry: RegistryEntry = {
+          const existing = readSessionState(myId);
+          const fallbackEntry: RegistryEntry = existing ?? {
             sessionId: myId,
             cwd: process.cwd(),
             pid: process.pid,
             startedAt: new Date().toISOString(),
             status: "active",
           };
-          const itermId = process.env.DISPATCH_ITERM_ID;
-          if (itermId) {
-            const pfPath = path.join(DISPATCH_DIR, `_pending_iterm_${itermId}.json`);
-            if (fs.existsSync(pfPath)) {
-              const data = JSON.parse(fs.readFileSync(pfPath, "utf-8")) as { spawnedBy?: string; name?: string };
-              fallbackEntry.itermSessionId = itermId;
-              fallbackEntry.spawnedBy = data.spawnedBy;
-              if (data.name) fallbackEntry.label = data.name;
-              fs.unlinkSync(pfPath);
+          fallbackEntry.pid = process.pid;
+          fallbackEntry.status = "active";
+          delete fallbackEntry.endedAt;
+          if (!fallbackEntry.spawnedBy) {
+            const exactClaim = matchingPendingSpawn();
+            if (exactClaim) {
+              applyPendingRecord(fallbackEntry, exactClaim);
+              pendingClaimPath = exactClaim.path;
+            } else {
+              pendingClaimPath = applyLegacyITermPending(fallbackEntry);
             }
           }
           writeSessionState(myId, fallbackEntry);
+          unlinkClaim(pendingClaimPath);
+          pendingClaimPath = undefined;
         } catch {}
       } catch (fallbackError) {
         console.error("Dispatch session_start fallback failed:", fallbackError);
@@ -396,6 +481,7 @@ export default function (pi: ExtensionAPI) {
         myId,
         spawnedBy: myEntry?.spawnedBy,
         label: myEntry?.label,
+        terminal: myEntry?.terminal,
         itermSessionId: myEntry?.itermSessionId,
         lastInboxCount,
       } as DispatchPersistedState;
@@ -657,12 +743,12 @@ export default function (pi: ExtensionAPI) {
     },
   });
 
-  // --- Spawn: create a new iTerm2 tab with a Pi session ---
+  // --- Spawn: create a new Herdr or iTerm2 tab with a Pi session ---
 
   pi.registerTool({
     name: "dispatch_spawn",
     description:
-      "Spawn a new Pi session in a new iTerm2 tab. The child session gets the dispatch extension auto-loaded so it can communicate back. Returns immediately — the child will send a message to your inbox when it's ready. Note: dispatch_spawn validates the thinking enum and model syntax but cannot reliably preflight model-specific thinking compatibility; a provider compatibility error may surface asynchronously inside the child after spawn succeeds.",
+      "Spawn a new Pi session in a terminal tab. Inside Herdr, the child opens unfocused in the parent's live workspace, waits until Pi is ready, then receives the task through Herdr's agent API; otherwise the existing iTerm2 flow is used. The child gets dispatch auto-loaded and will message when ready. Model syntax and the thinking enum are validated, but provider compatibility can still fail in the child.",
     parameters: Type.Object({
       task: Type.String({ description: "The task/prompt to give the new Pi session" }),
       cwd: Type.Optional(Type.String({ description: "Working directory for the new session (default: current directory)" })),
@@ -683,15 +769,21 @@ export default function (pi: ExtensionAPI) {
       extensions: Type.Optional(Type.String({ description: "Comma-separated additional extensions to load (e.g. 'slack,gworkspace')" })),
       skills: Type.Optional(Type.String({ description: "Comma-separated skills to load (e.g. 'graphite,stack')" })),
     }),
-    execute: async (_toolCallId, args) => {
-      const shellEscape = (s: string) => `'${s.replace(/'/g, "'\\''")}'`;
-      const taskDir = args.cwd ?? process.cwd();
+    execute: async (_toolCallId, args, signal) => {
+      const taskDir = resolveSpawnCwd(args.cwd, process.cwd(), os.homedir());
+      try {
+        if (!fs.statSync(taskDir).isDirectory()) {
+          throw new Error("not a directory");
+        }
+      } catch {
+        return {
+          content: [{ type: "text" as const, text: `Invalid working directory: ${taskDir}` }],
+          isError: true,
+        };
+      }
 
-      // Validate model/thinking overrides up front using the pure core helper so
-      // callers get a clear error before we attempt to launch iTerm2/Pi. `undefined`
-      // means omitted; an explicit empty string is invalid and not silently coerced
-      // to a default. The approved dispatch API forbids the native
-      // "provider/model:level" shorthand — callers use the separate `thinking` field.
+      // Validate overrides before allocating a terminal. Provider/model-specific
+      // thinking compatibility remains Pi/provider-owned at child launch time.
       const { flags: spawnFlags, error: spawnFlagError } = buildSpawnFlags({
         model: args.model,
         thinking: args.thinking,
@@ -703,7 +795,6 @@ export default function (pi: ExtensionAPI) {
         };
       }
 
-      // Prepend child agent guidelines to the task
       const preamble = [
         "You were dispatched as a child session by an orchestrator. Follow these guidelines:",
         "",
@@ -722,46 +813,49 @@ export default function (pi: ExtensionAPI) {
         "",
         "YOUR TASK:",
       ].join("\n");
-
-      const task = preamble + "\n" + args.task;
-
-      // Build the pi command — launch normally so all extensions/MCPs/skills auto-discover
-      // dispatch.ts is in ~/.pi/agent/extensions/ so it loads automatically
-      let piCmd = "pi";
-      // Append --model <value> and/or --thinking <level> only when supplied.
-      // spawnFlags is an ordered token list (e.g. ["--model", "anthropic/...",
-      // "--thinking", "high"]); shellEscape every forwarded value.
-      for (let i = 0; i < spawnFlags.length; i += 2) {
-        const flagName = spawnFlags[i];
-        const flagValue = spawnFlags[i + 1];
-        piCmd += ` ${flagName} ${shellEscape(flagValue)}`;
-      }
-
-      if (args.extensions) {
-        for (const ext of args.extensions.split(",").map((s) => s.trim()).filter(Boolean)) {
-          piCmd += ` -e ${shellEscape(ext)}`;
-        }
-      }
-
-      if (args.skills) {
-        for (const s of args.skills.split(",").map((s) => s.trim()).filter(Boolean)) {
-          piCmd += ` --skill ${shellEscape(s)}`;
-        }
-      }
-
-      piCmd += ` ${shellEscape(task)}`;
-
-      // Write Python script to temp file to avoid shell escaping issues
-      const tmpScript = path.join(DISPATCH_DIR, `_spawn_${Date.now()}.py`);
-      const taskDirEscaped = shellEscape(taskDir);
-      const piCmdStr = piCmd;
+      const task = `${preamble}\n${args.task}`;
+      const piOptions = {
+        flags: spawnFlags,
+        extensions: args.extensions,
+        skills: args.skills,
+      };
+      const piArgs = buildPiArgs(piOptions);
+      const piCmd = buildPiCommand({ task, ...piOptions });
       const childName = args.name || undefined;
 
-      // Pass spawn metadata to Python so it can write the pending file
-      // BEFORE sending the pi command (avoids race condition where child
-      // starts before the pending file exists)
-      const spawnMeta = JSON.stringify({ spawnedBy: myId, name: childName });
+      if (isHerdrEnvironment(process.env)) {
+        const spawned = await spawnHerdrChild({
+          dispatchDir: DISPATCH_DIR,
+          cwd: taskDir,
+          name: childName,
+          piArgs,
+          task,
+          spawnedBy: myId,
+          signal,
+        });
+        updateWidget();
+        return {
+          content: [{
+            type: "text" as const,
+            text: [
+              "Spawned new Pi session in an unfocused Herdr tab.",
+              `Workspace: ${spawned.terminal.workspaceId}`,
+              `Tab: ${spawned.terminal.tabId}`,
+              `Pane: ${spawned.terminal.paneId}`,
+              `Directory: ${taskDir}`,
+              `Task: ${args.task}`,
+              "",
+              "The child will register with dispatch and send a message when ready.",
+            ].join("\n"),
+          }],
+        };
+      }
 
+      // Existing iTerm2 path. Pending metadata is written before the command so
+      // the child can correlate deterministically during session_start.
+      const tmpScript = path.join(DISPATCH_DIR, `_spawn_${Date.now()}.py`);
+      const taskDirEscaped = shellEscape(taskDir);
+      const spawnMeta = JSON.stringify({ spawnedBy: myId, name: childName });
       const pyScript = [
         "import iterm2",
         "import json",
@@ -776,8 +870,6 @@ export default function (pi: ExtensionAPI) {
         "    tab = await window.async_create_tab()",
         "    session = tab.current_session",
         "",
-        "    # Write pending file BEFORE sending the pi command",
-        "    # so the child can pick it up during session_start",
         `    meta = json.loads(${JSON.stringify(spawnMeta)})`,
         "    meta['itermSessionId'] = session.session_id",
         `    pending_path = os.path.join(${JSON.stringify(DISPATCH_DIR)}, f'_pending_iterm_{session.session_id}.json')`,
@@ -785,7 +877,7 @@ export default function (pi: ExtensionAPI) {
         "        json.dump(meta, f)",
         "",
         `    task_dir = ${JSON.stringify(taskDirEscaped)}`,
-        `    pi_cmd = ${JSON.stringify(piCmdStr)}`,
+        `    pi_cmd = ${JSON.stringify(piCmd)}`,
         `    cmd = f"cd {task_dir} && DISPATCH_ITERM_ID='{session.session_id}' {pi_cmd}" + chr(13)`,
         "    await session.async_send_text(cmd)",
         "    print(f'SPAWNED:{session.session_id}')",
@@ -794,73 +886,97 @@ export default function (pi: ExtensionAPI) {
       ].join("\n");
 
       fs.writeFileSync(tmpScript, pyScript);
-
       try {
         const result = execSync(`${ITERM_PY} ${tmpScript}`, {
-          timeout: 30000,
+          timeout: 30_000,
           encoding: "utf-8",
         }).trim();
-
-        // Clean up temp script
         try { fs.unlinkSync(tmpScript); } catch {}
 
         const match = result.match(/SPAWNED:(.+)/);
-        if (match) {
-          const itermId = match[1];
-
-          // Widget will update when child registers and sends its first message
-          updateWidget();
-
-          return {
-            content: [
-              {
-                type: "text" as const,
-                text: `Spawned new Pi session in iTerm2 tab.\niTerm session: ${itermId}\nDirectory: ${taskDir}\nTask: ${task}\n\nThe child session will register with dispatch and send a message when ready.`,
-              },
-            ],
-          };
+        if (!match) {
+          return { content: [{ type: "text" as const, text: `iTerm2 output: ${result}` }] };
         }
-
-        return { content: [{ type: "text" as const, text: `iTerm2 output: ${result}` }] };
-      } catch (err: any) {
+        const itermId = match[1];
+        updateWidget();
+        return {
+          content: [{
+            type: "text" as const,
+            text: [
+              "Spawned new Pi session in iTerm2 tab.",
+              `iTerm session: ${itermId}`,
+              `Directory: ${taskDir}`,
+              `Task: ${args.task}`,
+              "",
+              "The child will register with dispatch and send a message when ready.",
+            ].join("\n"),
+          }],
+        };
+      } catch (error: any) {
         try { fs.unlinkSync(tmpScript); } catch {}
         return {
-          content: [{ type: "text" as const, text: `Failed to spawn: ${err.message ?? err}` }],
+          content: [{ type: "text" as const, text: `Failed to spawn: ${error.message ?? error}` }],
           isError: true,
         };
       }
     },
   });
 
-  // --- Close: terminate a child session's iTerm2 tab ---
+  // --- Close: terminate a child session's recorded terminal tab ---
 
   pi.registerTool({
     name: "dispatch_close",
     description:
-      "Close a child Pi session by terminating its iTerm2 tab. Use the session ID from dispatch_list.",
+      "Close a child Pi session by terminating its recorded Herdr or iTerm2 tab. Use the session ID from dispatch_list.",
     parameters: Type.Object({
       target: Type.String({ description: "Session ID to close" }),
     }),
-    execute: async (_toolCallId, args) => {
+    execute: async (_toolCallId, args, signal) => {
       const entry = readSessionState(args.target);
 
       if (!entry) {
         return { content: [{ type: "text" as const, text: `Session ${args.target} not found in registry.` }], isError: true };
       }
 
-      const itermId = entry.itermSessionId;
+      let terminal: TerminalLocation | undefined;
+      if (entry.terminal !== undefined) {
+        if (!isTerminalLocation(entry.terminal)) {
+          throw new Error(`Session ${args.target} has invalid terminal metadata; refusing to guess what to close.`);
+        }
+        terminal = entry.terminal;
+      } else if (entry.itermSessionId) {
+        terminal = { kind: "iterm2", sessionId: entry.itermSessionId };
+      }
 
+      if (terminal?.kind === "herdr") {
+        const result = await closeHerdrTab(terminal, { signal });
+        if (result.alreadyMissing && processIsAlive(entry.pid)) {
+          throw new Error(
+            `Herdr tab ${terminal.tabId} was not found but child pid ${entry.pid} is still alive; no fallback process was killed.`,
+          );
+        }
+        entry.status = "ended";
+        entry.endedAt = new Date().toISOString();
+        writeSessionState(args.target, entry);
+        updateWidget();
+        const text = result.closed
+          ? `Closed session ${args.target.slice(0, 12)} (Herdr tab ${terminal.tabId}).`
+          : `Herdr tab ${terminal.tabId} was already gone; marked the ended child session accordingly.`;
+        return { content: [{ type: "text" as const, text }] };
+      }
+
+      const itermId = terminal?.kind === "iterm2" ? terminal.sessionId : undefined;
       if (!itermId) {
-        // No iTerm session ID — try killing by PID as fallback
+        // Sessions without a terminal handle predate managed tab spawning.
         try {
           process.kill(entry.pid, "SIGTERM");
           entry.status = "ended";
           entry.endedAt = new Date().toISOString();
           writeSessionState(args.target, entry);
           updateWidget();
-          return { content: [{ type: "text" as const, text: `Sent SIGTERM to pid ${entry.pid}. No iTerm session ID was recorded.` }] };
+          return { content: [{ type: "text" as const, text: `Sent SIGTERM to pid ${entry.pid}. No terminal tab was recorded.` }] };
         } catch {
-          return { content: [{ type: "text" as const, text: `No iTerm session ID and could not kill pid ${entry.pid}.` }], isError: true };
+          return { content: [{ type: "text" as const, text: `No terminal tab was recorded and pid ${entry.pid} could not be terminated.` }], isError: true };
         }
       }
 
