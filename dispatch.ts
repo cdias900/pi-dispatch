@@ -30,12 +30,10 @@ import {
   sessionDir as _sessionDir,
   buildPiArgs,
   buildPiCommand,
-  buildSpawnFlags,
   isTerminalLocation,
   readPendingSpawn,
   resolveSpawnCwd,
   shellEscape,
-  THINKING_LEVELS,
   type PendingSpawnRecord,
   type RegistryEntry,
   type Message,
@@ -748,24 +746,11 @@ export default function (pi: ExtensionAPI) {
   pi.registerTool({
     name: "dispatch_spawn",
     description:
-      "Spawn a new Pi session in a terminal tab. Inside Herdr, the child opens unfocused in the parent's live workspace, waits until Pi is ready, then receives the task through Herdr's agent API; otherwise the existing iTerm2 flow is used. The child gets dispatch auto-loaded and will message when ready. Model syntax and the thinking enum are validated, but provider compatibility can still fail in the child.",
+      "Spawn a new Pi session in a terminal tab. Inside Herdr, the child opens unfocused in the parent's live workspace, waits until Pi is ready, then receives the task through Herdr's agent API; otherwise the existing iTerm2 flow is used. The child gets dispatch auto-loaded and will message when ready. The child always runs Pi's default model and thinking level; this tool cannot choose or change them.",
     parameters: Type.Object({
       task: Type.String({ description: "The task/prompt to give the new Pi session" }),
       cwd: Type.Optional(Type.String({ description: "Working directory for the new session (default: current directory)" })),
       name: Type.Optional(Type.String({ description: "Human-readable name for this child session (shown in messages and dispatch_list)" })),
-      model: Type.Optional(Type.String({
-        description:
-          "Optional model override. Must be an exact native provider-qualified reference of the form \"provider/modelId\" (e.g. \"anthropic/claude-sonnet-5\", \"openai/gpt-5.6-sol\"). Bare or fuzzy aliases such as \"sonnet\" or \"*sonnet*\" are rejected; use the full provider/model form. Do NOT append a thinking suffix like \"provider/model:high\" — use the separate \"thinking\" field instead. Omit to inherit the agent default. Registry existence of the model is still checked by Pi at launch time, not by this tool. Note: when `thinking` is also provided, explicitly supplying `model` improves predictability because the child uses the model you named to determine compatibility; if `model` is omitted the child uses its normal default model, which determines compatibility instead.",
-      })),
-      thinking: Type.Optional(
-        Type.Union(
-          THINKING_LEVELS.map((level) => Type.Literal(level)),
-          {
-            description:
-              "Optional thinking/reasoning level for the spawned session. Must be exactly one of: off, minimal, low, medium, high, xhigh, max. Omit to inherit the agent default. Pi exposes this global set of values, but individual models/providers may support only a subset; dispatch_spawn validates the enum and model syntax but cannot reliably preflight model-specific compatibility (Pi registry metadata can itself be stale or wrong). If `model` is omitted the child uses its normal default model, and that inherited model determines which thinking levels actually work. No compatibility table is maintained here and unsupported levels are not clamped.",
-          },
-        ),
-      ),
       extensions: Type.Optional(Type.String({ description: "Comma-separated additional extensions to load (e.g. 'slack,gworkspace')" })),
       skills: Type.Optional(Type.String({ description: "Comma-separated skills to load (e.g. 'graphite,stack')" })),
     }),
@@ -778,19 +763,6 @@ export default function (pi: ExtensionAPI) {
       } catch {
         return {
           content: [{ type: "text" as const, text: `Invalid working directory: ${taskDir}` }],
-          isError: true,
-        };
-      }
-
-      // Validate overrides before allocating a terminal. Provider/model-specific
-      // thinking compatibility remains Pi/provider-owned at child launch time.
-      const { flags: spawnFlags, error: spawnFlagError } = buildSpawnFlags({
-        model: args.model,
-        thinking: args.thinking,
-      });
-      if (spawnFlagError) {
-        return {
-          content: [{ type: "text" as const, text: `Invalid spawn options: ${spawnFlagError}` }],
           isError: true,
         };
       }
@@ -815,7 +787,6 @@ export default function (pi: ExtensionAPI) {
       ].join("\n");
       const task = `${preamble}\n${args.task}`;
       const piOptions = {
-        flags: spawnFlags,
         extensions: args.extensions,
         skills: args.skills,
       };
